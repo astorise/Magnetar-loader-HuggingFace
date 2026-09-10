@@ -271,6 +271,19 @@ fn discover_sharded(
         shard_inventories.insert((*shard_filename).clone(), (artifact, start, shard_path));
     }
 
+    // Every shard's *real* parsed inventory (not merely the index's own
+    // mapping) must not declare the same tensor name twice across shards
+    // -- reuses the existing generic duplicate-tensor detection rather
+    // than a parallel check (Decision 1's "compose, don't reimplement").
+    let all_real_tensors: Vec<ModelTensorMetadata> = shard_inventories
+        .values()
+        .flat_map(|(artifact, _, _)| artifact.tensors.clone())
+        .collect();
+    magnetar_runtime::model_format_roadmap::detect_duplicate_tensor_names(&all_real_tensors)
+        .map_err(|error| ProductionIngestionError::MalformedMetadata {
+            reason: error.to_string(),
+        })?;
+
     let mut locations = BTreeMap::new();
     let mut tensors = Vec::with_capacity(index.weight_map.len());
     let mut seen_tensor_names = std::collections::BTreeSet::new();
@@ -442,6 +455,77 @@ mod tests {
             .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
         assert_eq!(values, vec![2.0, 3.0]);
+    }
+
+    #[test]
+    fn rejects_a_tensor_duplicated_across_two_real_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        // Both shards genuinely declare "weight.a" in their own real
+        // Safetensors header -- a corrupt/inconsistent shard pair, not
+        // merely an index mapping mistake.
+        write_safetensors_file(
+            &dir.path().join("model-00001-of-00002.safetensors"),
+            &[("weight.a", &[1.0])],
+        );
+        // Shard 2 also physically declares "weight.a" in its own real
+        // header, even though the index below only ever points at it for
+        // "weight.b" -- both shards still get discovered (the index
+        // references each of them for some tensor), so the cross-shard
+        // scan over their *real* inventories is what must catch this.
+        write_safetensors_file(
+            &dir.path().join("model-00002-of-00002.safetensors"),
+            &[("weight.a", &[2.0]), ("weight.b", &[3.0])],
+        );
+        let index = serde_json::json!({
+            "metadata": {},
+            "weight_map": {
+                "weight.a": "model-00001-of-00002.safetensors",
+                "weight.b": "model-00002-of-00002.safetensors",
+            }
+        });
+        fs::write(
+            dir.path().join(INDEX_FILE_NAME),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        let error = match discover_and_parse_weights(&source) {
+            Err(error) => error,
+            Ok(_) => panic!("expected a duplicate-tensor-across-shards error"),
+        };
+        assert!(matches!(
+            error,
+            ProductionIngestionError::MalformedMetadata { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_a_tensor_digest_mismatch_at_payload_read_time() {
+        let dir = tempfile::tempdir().unwrap();
+        write_safetensors_file(&dir.path().join(SINGLE_FILE_NAME), &[("weight.a", &[1.0])]);
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        let (tensors, _shards, payload_source) = discover_and_parse_weights(&source).unwrap();
+        let tensor_a = tensors.iter().find(|t| t.name == "weight.a").unwrap();
+        let range = ProductionPayloadRange {
+            identity: tensor_a.name.clone(),
+            offset: tensor_a.offset_bytes.unwrap(),
+            length: tensor_a.size_bytes.unwrap(),
+            digest: Some(ModelDigest::sha256(b"not the real tensor bytes")),
+        };
+        let error = match payload_source.read_payload(&range) {
+            Err(error) => error,
+            Ok(_) => panic!("expected an integrity mismatch error"),
+        };
+        assert!(matches!(
+            error,
+            ProductionIngestionError::IntegrityMismatch { .. }
+        ));
     }
 
     #[test]
