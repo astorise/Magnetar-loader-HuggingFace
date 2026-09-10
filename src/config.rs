@@ -306,6 +306,54 @@ mod tests {
     }
 
     #[test]
+    fn rejects_wrong_field_type() {
+        let mut config: serde_json::Value = serde_json::from_slice(&qwen2_0_5b_config()).unwrap();
+        config["hidden_size"] = serde_json::json!("not-a-number");
+        let bytes = serde_json::to_vec(&config).unwrap();
+        let error = parse(&bytes).unwrap_err();
+        assert!(matches!(
+            error,
+            ProductionIngestionError::MalformedMetadata { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_vocab_size() {
+        let mut config: serde_json::Value = serde_json::from_slice(&qwen2_0_5b_config()).unwrap();
+        config["vocab_size"] = serde_json::json!(0);
+        let bytes = serde_json::to_vec(&config).unwrap();
+        let error = parse(&bytes).unwrap_err();
+        assert!(matches!(
+            error,
+            ProductionIngestionError::MalformedMetadata { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_non_positive_rope_theta() {
+        let mut config: serde_json::Value = serde_json::from_slice(&qwen2_0_5b_config()).unwrap();
+        config["rope_theta"] = serde_json::json!(-1.0);
+        let bytes = serde_json::to_vec(&config).unwrap();
+        let error = parse(&bytes).unwrap_err();
+        assert!(matches!(
+            error,
+            ProductionIngestionError::MalformedMetadata { .. }
+        ));
+    }
+
+    #[test]
+    fn derives_head_dim_only_when_evenly_divisible() {
+        let mut config: serde_json::Value = serde_json::from_slice(&qwen2_0_5b_config()).unwrap();
+        config["hidden_size"] = serde_json::json!(897); // not divisible by 14
+        let bytes = serde_json::to_vec(&config).unwrap();
+        let error = parse(&bytes).unwrap_err();
+        assert!(matches!(
+            error,
+            ProductionIngestionError::MalformedMetadata { .. }
+        ));
+    }
+
+    #[test]
     fn torch_dtype_is_preserved_as_annotation_only() {
         let normalized = parse(&qwen2_0_5b_config()).unwrap();
         assert_eq!(
