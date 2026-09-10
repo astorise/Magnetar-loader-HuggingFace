@@ -30,7 +30,7 @@ pub use tokenizer::{
     HuggingFaceTokenizer, parse_generation_config, parse_tokenizer_config,
     required_special_token_kinds,
 };
-pub use weight_layout::TransposingPayloadSource;
+pub use weight_layout::{TransposingPayloadSource, swap_declared_projection_shapes};
 pub use weights::SafetensorsPayloadSource;
 
 use magnetar_runtime::model::{
