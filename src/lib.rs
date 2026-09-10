@@ -21,6 +21,7 @@
 mod config;
 mod naming;
 mod tokenizer;
+mod weight_layout;
 mod weights;
 
 pub use config::{NormalizedHfConfig, parse as parse_config};
@@ -29,6 +30,7 @@ pub use tokenizer::{
     HuggingFaceTokenizer, parse_generation_config, parse_tokenizer_config,
     required_special_token_kinds,
 };
+pub use weight_layout::TransposingPayloadSource;
 pub use weights::SafetensorsPayloadSource;
 
 use magnetar_runtime::model::{
@@ -100,12 +102,24 @@ impl ProductionModelArtifactIngestor for HuggingFaceIngestor {
         })?;
         let normalized_config = config::parse(&config_bytes)?;
 
-        let (tensors, shards, payload_source) = weights::discover_and_parse_weights(source)?;
+        let (mut tensors, shards, payload_source) = weights::discover_and_parse_weights(source)?;
         if tensors.is_empty() {
             return Err(ProductionIngestionError::MalformedMetadata {
                 reason: "no tensors were discovered in this bundle's weight files".into(),
             });
         }
+
+        // Every 2D projection weight (q/k/v/o_proj, gate/up/down_proj,
+        // lm_head) is stored (and therefore discovered) as `nn.Linear`'s
+        // own [out_features, in_features] convention; the Component
+        // expects [in_features, out_features] instead -- see
+        // `weight_layout.rs`. `token_embedding` (a lookup table) and the
+        // 1D normalization vectors are excluded structurally, never
+        // transposed.
+        let payload_source: Arc<dyn ProductionArtifactPayloadSource> = Arc::new(
+            weight_layout::TransposingPayloadSource::new(payload_source, &tensors),
+        );
+        weight_layout::swap_declared_projection_shapes(&mut tensors);
 
         let storage_dtype = tensors.first().map(|tensor| tensor.storage_dtype);
         let mut supported_compute_dtypes = BTreeSet::new();
@@ -241,7 +255,7 @@ impl ProductionModelArtifactIngestor for HuggingFaceIngestor {
 
         Ok(ProductionIngestionResult {
             manifest,
-            payload_source: Arc::new(payload_source) as Arc<dyn ProductionArtifactPayloadSource>,
+            payload_source,
         })
     }
 }
