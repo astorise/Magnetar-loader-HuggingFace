@@ -164,15 +164,32 @@ pub fn discover_and_parse_weights(
     ),
     ProductionIngestionError,
 > {
-    if let Ok(index_path) = source.resolve(INDEX_FILE_NAME) {
-        return discover_sharded(source, &index_path);
+    let (mut tensors, shards, mut payload_source) =
+        if let Ok(index_path) = source.resolve(INDEX_FILE_NAME) {
+            discover_sharded(source, &index_path)?
+        } else if let Ok(single_path) = source.resolve(SINGLE_FILE_NAME) {
+            discover_single_file(&single_path)?
+        } else {
+            return Err(ProductionIngestionError::RequiredPartMissing {
+                part: format!("{SINGLE_FILE_NAME} or {INDEX_FILE_NAME}"),
+            });
+        };
+    // Real Hugging Face tensor names (e.g. "model.layers.0.self_attn.
+    // q_proj.weight") are normalized into the canonical Model Artifact
+    // names the Qwen Component's weight-edge calls resolve directly --
+    // both the returned inventory and the payload source's own lookup
+    // keys are renamed together so `read_payload` stays reachable by the
+    // canonical identity Model Loading will actually request.
+    let mut renamed_locations = BTreeMap::new();
+    for tensor in &mut tensors {
+        let canonical = crate::naming::normalize_tensor_name(&tensor.name)?;
+        if let Some(location) = payload_source.locations.remove(&tensor.name) {
+            renamed_locations.insert(canonical.clone(), location);
+        }
+        tensor.name = canonical;
     }
-    if let Ok(single_path) = source.resolve(SINGLE_FILE_NAME) {
-        return discover_single_file(&single_path);
-    }
-    Err(ProductionIngestionError::RequiredPartMissing {
-        part: format!("{SINGLE_FILE_NAME} or {INDEX_FILE_NAME}"),
-    })
+    payload_source.locations = renamed_locations;
+    Ok((tensors, shards, payload_source))
 }
 
 fn discover_single_file(
@@ -378,7 +395,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_safetensors_file(
             &dir.path().join(SINGLE_FILE_NAME),
-            &[("weight.a", &[1.0, 2.0]), ("weight.b", &[3.0])],
+            &[
+                ("model.embed_tokens.weight", &[1.0, 2.0]),
+                ("model.norm.weight", &[3.0]),
+            ],
         );
         let source = ProductionModelSource::authorized_local_bundle(
             ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
@@ -388,7 +408,10 @@ mod tests {
         assert_eq!(tensors.len(), 2);
         assert!(shards.is_empty());
 
-        let tensor_a = tensors.iter().find(|t| t.name == "weight.a").unwrap();
+        let tensor_a = tensors
+            .iter()
+            .find(|t| t.name == "token_embedding")
+            .unwrap();
         let range = ProductionPayloadRange {
             identity: tensor_a.name.clone(),
             offset: tensor_a.offset_bytes.unwrap(),
@@ -410,17 +433,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_safetensors_file(
             &dir.path().join("model-00001-of-00002.safetensors"),
-            &[("weight.a", &[1.0])],
+            &[("model.embed_tokens.weight", &[1.0])],
         );
         write_safetensors_file(
             &dir.path().join("model-00002-of-00002.safetensors"),
-            &[("weight.b", &[2.0, 3.0])],
+            &[("model.norm.weight", &[2.0, 3.0])],
         );
         let index = serde_json::json!({
             "metadata": {"total_size": 12},
             "weight_map": {
-                "weight.a": "model-00001-of-00002.safetensors",
-                "weight.b": "model-00002-of-00002.safetensors",
+                "model.embed_tokens.weight": "model-00001-of-00002.safetensors",
+                "model.norm.weight": "model-00002-of-00002.safetensors",
             }
         });
         fs::write(
@@ -436,7 +459,7 @@ mod tests {
         assert_eq!(tensors.len(), 2);
         assert_eq!(shards.len(), 2);
 
-        let tensor_b = tensors.iter().find(|t| t.name == "weight.b").unwrap();
+        let tensor_b = tensors.iter().find(|t| t.name == "final_norm").unwrap();
         assert_eq!(
             tensor_b.shard.as_ref().unwrap().as_str(),
             "model-00002-of-00002.safetensors"
@@ -460,27 +483,31 @@ mod tests {
     #[test]
     fn rejects_a_tensor_duplicated_across_two_real_shards() {
         let dir = tempfile::tempdir().unwrap();
-        // Both shards genuinely declare "weight.a" in their own real
-        // Safetensors header -- a corrupt/inconsistent shard pair, not
-        // merely an index mapping mistake.
+        // Both shards genuinely declare "model.embed_tokens.weight" in
+        // their own real Safetensors header -- a corrupt/inconsistent
+        // shard pair, not merely an index mapping mistake.
         write_safetensors_file(
             &dir.path().join("model-00001-of-00002.safetensors"),
-            &[("weight.a", &[1.0])],
+            &[("model.embed_tokens.weight", &[1.0])],
         );
-        // Shard 2 also physically declares "weight.a" in its own real
-        // header, even though the index below only ever points at it for
-        // "weight.b" -- both shards still get discovered (the index
-        // references each of them for some tensor), so the cross-shard
-        // scan over their *real* inventories is what must catch this.
+        // Shard 2 also physically declares "model.embed_tokens.weight" in
+        // its own real header, even though the index below only ever
+        // points at it for "model.norm.weight" -- both shards still get
+        // discovered (the index references each of them for some
+        // tensor), so the cross-shard scan over their *real* inventories
+        // is what must catch this.
         write_safetensors_file(
             &dir.path().join("model-00002-of-00002.safetensors"),
-            &[("weight.a", &[2.0]), ("weight.b", &[3.0])],
+            &[
+                ("model.embed_tokens.weight", &[2.0]),
+                ("model.norm.weight", &[3.0]),
+            ],
         );
         let index = serde_json::json!({
             "metadata": {},
             "weight_map": {
-                "weight.a": "model-00001-of-00002.safetensors",
-                "weight.b": "model-00002-of-00002.safetensors",
+                "model.embed_tokens.weight": "model-00001-of-00002.safetensors",
+                "model.norm.weight": "model-00002-of-00002.safetensors",
             }
         });
         fs::write(
@@ -505,13 +532,19 @@ mod tests {
     #[test]
     fn rejects_a_tensor_digest_mismatch_at_payload_read_time() {
         let dir = tempfile::tempdir().unwrap();
-        write_safetensors_file(&dir.path().join(SINGLE_FILE_NAME), &[("weight.a", &[1.0])]);
+        write_safetensors_file(
+            &dir.path().join(SINGLE_FILE_NAME),
+            &[("model.embed_tokens.weight", &[1.0])],
+        );
         let source = ProductionModelSource::authorized_local_bundle(
             ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
             dir.path().to_path_buf(),
         );
         let (tensors, _shards, payload_source) = discover_and_parse_weights(&source).unwrap();
-        let tensor_a = tensors.iter().find(|t| t.name == "weight.a").unwrap();
+        let tensor_a = tensors
+            .iter()
+            .find(|t| t.name == "token_embedding")
+            .unwrap();
         let range = ProductionPayloadRange {
             identity: tensor_a.name.clone(),
             offset: tensor_a.offset_bytes.unwrap(),
@@ -533,7 +566,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let index = serde_json::json!({
             "metadata": {},
-            "weight_map": {"weight.a": "does-not-exist.safetensors"}
+            "weight_map": {"model.embed_tokens.weight": "does-not-exist.safetensors"}
         });
         fs::write(
             dir.path().join(INDEX_FILE_NAME),
@@ -562,6 +595,77 @@ mod tests {
         assert!(matches!(
             error,
             ProductionIngestionError::RequiredPartMissing { .. }
+        ));
+    }
+
+    #[test]
+    fn normalizes_per_layer_tensor_names_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        write_safetensors_file(
+            &dir.path().join(SINGLE_FILE_NAME),
+            &[
+                ("model.embed_tokens.weight", &[1.0]),
+                ("model.layers.0.self_attn.q_proj.weight", &[2.0]),
+                ("model.layers.0.mlp.down_proj.weight", &[3.0]),
+                ("model.norm.weight", &[4.0]),
+                ("lm_head.weight", &[5.0]),
+            ],
+        );
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        let (tensors, _shards, payload_source) = discover_and_parse_weights(&source).unwrap();
+        let names: std::collections::BTreeSet<String> =
+            tensors.iter().map(|t| t.name.clone()).collect();
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from([
+                "token_embedding".to_string(),
+                "layers.0.self_attn.q_proj".to_string(),
+                "layers.0.mlp.down_proj".to_string(),
+                "final_norm".to_string(),
+                "lm_head".to_string(),
+            ])
+        );
+        // The payload source's own lookup keys were renamed in lockstep --
+        // a canonical identity actually reads real bytes, not just the
+        // returned tensor inventory's names.
+        let q_proj = tensors
+            .iter()
+            .find(|t| t.name == "layers.0.self_attn.q_proj")
+            .unwrap();
+        let range = ProductionPayloadRange {
+            identity: q_proj.name.clone(),
+            offset: q_proj.offset_bytes.unwrap(),
+            length: q_proj.size_bytes.unwrap(),
+            digest: None,
+        };
+        let bytes = payload_source.read_payload(&range).unwrap();
+        assert_eq!(f32::from_le_bytes(bytes.try_into().unwrap()), 2.0);
+    }
+
+    #[test]
+    fn rejects_a_bias_tensor() {
+        let dir = tempfile::tempdir().unwrap();
+        write_safetensors_file(
+            &dir.path().join(SINGLE_FILE_NAME),
+            &[
+                ("model.embed_tokens.weight", &[1.0]),
+                ("model.layers.0.self_attn.q_proj.bias", &[0.0]),
+            ],
+        );
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        let error = match discover_and_parse_weights(&source) {
+            Err(error) => error,
+            Ok(_) => panic!("expected a bias-tensor rejection"),
+        };
+        assert!(matches!(
+            error,
+            ProductionIngestionError::UnsupportedFormat { .. }
         ));
     }
 }

@@ -19,10 +19,12 @@
 //! Loading may materialize anything from it.
 
 mod config;
+mod naming;
 mod tokenizer;
 mod weights;
 
 pub use config::{NormalizedHfConfig, parse as parse_config};
+pub use naming::normalize_tensor_name;
 pub use tokenizer::{
     HuggingFaceTokenizer, parse_generation_config, parse_tokenizer_config,
     required_special_token_kinds,
@@ -275,7 +277,11 @@ mod tests {
     fn write_tiny_safetensors(path: &std::path::Path) {
         let mut header = serde_json::Map::new();
         let mut data = Vec::new();
-        for name in ["token_embedding", "final_norm", "lm_head"] {
+        for name in [
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+        ] {
             let start = data.len() as u64;
             data.extend_from_slice(&1.0f32.to_le_bytes());
             let end = data.len() as u64;
