@@ -1,0 +1,38 @@
+[workspace]
+
+[package]
+name = "magnetar-loader-huggingface"
+version = "0.1.0"
+edition = "2024"
+# Never published to crates.io independently -- this crate is only
+# buildable from within a checkout of the parent Magnetar repository (see
+# the path dependency comments below), matching every other externalized
+# module's own Cargo.toml (`providers/cpu`, `formats/safetensors`, ...).
+publish = false
+
+[dependencies]
+# Path dependencies, not published crates: this crate is only buildable
+# from within a checkout of the parent Magnetar repository, with this
+# submodule checked out at `loaders/huggingface` (matching CI's
+# `submodules: recursive` checkout and the same pattern used by
+# `providers/cpu`/`formats/safetensors`). `magnetar-runtime` supplies the
+# generic production-model-ingestion contract this crate implements
+# (`ProductionModelArtifactIngestor`, `ProductionModelSource`,
+# `ProductionArtifactPayloadSource`) plus the generic Model Artifact/
+# Tokenizer/model-format-roadmap types this crate normalizes real bytes
+# into; `magnetar-format-safetensors` supplies the real Safetensors parser
+# this crate composes rather than reimplementing
+# (`implement-production-qwen-model-loading` Decision 1).
+magnetar-runtime = { path = "../../magnetar-runtime" }
+magnetar-format-safetensors = { path = "../../formats/safetensors" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+# The real `tokenizer.json`-backed implementation behind Tokenizer
+# Contract (task group 9). Kept out of `magnetar-runtime` entirely --
+# this external crate is the only place in the workspace that depends on
+# it.
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+
+[dev-dependencies]
+tempfile = "3"
