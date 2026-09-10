@@ -68,15 +68,30 @@ pub fn swap_declared_projection_shapes(tensors: &mut [ModelTensorMetadata]) {
     }
 }
 
+/// A transposed projection's shape and real per-element storage width
+/// (bytes), captured *before* [`swap_declared_projection_shapes`] runs.
+/// The element width matters: real Hugging Face checkpoints commonly
+/// store weights as F16/BF16 (2 bytes), not only F32 (4 bytes) -- a
+/// transpose that assumed F32 unconditionally would misread every real
+/// half-precision checkpoint's byte layout (found running a real
+/// `torch_dtype: "bfloat16"` Qwen2.5 checkpoint through this ingestor for
+/// the first time, task 12.4).
+struct TransposedTensorShape {
+    out_features: u64,
+    in_features: u64,
+    element_bytes: u64,
+}
+
 /// Wraps an inner payload source, transposing the bytes returned for
 /// every projection tensor identity in `original_shapes` (row-major
-/// `[out_features, in_features]` -> `[in_features, out_features]`) and
-/// passing every other identity through unchanged. `original_shapes`
-/// holds each transposed tensor's shape *before* swapping (as captured
-/// from real discovery, before [`swap_declared_projection_shapes`] runs).
+/// `[out_features, in_features]` -> `[in_features, out_features]`,
+/// preserving each element's own byte width) and passing every other
+/// identity through unchanged. `original_shapes` holds each transposed
+/// tensor's shape *before* swapping (as captured from real discovery,
+/// before [`swap_declared_projection_shapes`] runs).
 pub struct TransposingPayloadSource<S> {
     inner: S,
-    original_shapes: BTreeMap<String, (u64, u64)>,
+    original_shapes: BTreeMap<String, TransposedTensorShape>,
 }
 
 impl<S> TransposingPayloadSource<S> {
@@ -88,7 +103,16 @@ impl<S> TransposingPayloadSource<S> {
         let original_shapes = tensors
             .iter()
             .filter(|tensor| is_transposed_projection(&tensor.name) && tensor.shape.len() == 2)
-            .map(|tensor| (tensor.name.clone(), (tensor.shape[0], tensor.shape[1])))
+            .map(|tensor| {
+                (
+                    tensor.name.clone(),
+                    TransposedTensorShape {
+                        out_features: tensor.shape[0],
+                        in_features: tensor.shape[1],
+                        element_bytes: tensor.storage_dtype.descriptor().size_bytes(),
+                    },
+                )
+            })
             .collect();
         Self {
             inner,
@@ -105,34 +129,37 @@ impl<S: ProductionArtifactPayloadSource> ProductionArtifactPayloadSource
         range: &ProductionPayloadRange,
     ) -> Result<Vec<u8>, ProductionIngestionError> {
         let bytes = self.inner.read_payload(range)?;
-        let Some((out_features, in_features)) = self.original_shapes.get(&range.identity) else {
+        let Some(shape) = self.original_shapes.get(&range.identity) else {
             return Ok(bytes);
         };
-        let element_count = out_features.checked_mul(*in_features).ok_or_else(|| {
-            ProductionIngestionError::MalformedMetadata {
+        let element_count = shape
+            .out_features
+            .checked_mul(shape.in_features)
+            .ok_or_else(|| ProductionIngestionError::MalformedMetadata {
                 reason: format!("'{}' element count overflows", range.identity),
-            }
-        })?;
-        if bytes.len() as u64 != element_count.saturating_mul(4) {
+            })?;
+        if bytes.len() as u64 != element_count.saturating_mul(shape.element_bytes) {
             return Err(ProductionIngestionError::MalformedMetadata {
                 reason: format!(
-                    "'{}' byte length {} does not match {}x{} F32 elements",
+                    "'{}' byte length {} does not match {}x{} elements at {} bytes/element",
                     range.identity,
                     bytes.len(),
-                    out_features,
-                    in_features
+                    shape.out_features,
+                    shape.in_features,
+                    shape.element_bytes
                 ),
             });
         }
-        let rows = *out_features as usize;
-        let cols = *in_features as usize;
+        let rows = shape.out_features as usize;
+        let cols = shape.in_features as usize;
+        let element_bytes = shape.element_bytes as usize;
         let mut transposed = vec![0u8; bytes.len()];
         for row in 0..rows {
             for col in 0..cols {
-                let source_offset = (row * cols + col) * 4;
-                let dest_offset = (col * rows + row) * 4;
-                transposed[dest_offset..dest_offset + 4]
-                    .copy_from_slice(&bytes[source_offset..source_offset + 4]);
+                let source_offset = (row * cols + col) * element_bytes;
+                let dest_offset = (col * rows + row) * element_bytes;
+                transposed[dest_offset..dest_offset + element_bytes]
+                    .copy_from_slice(&bytes[source_offset..source_offset + element_bytes]);
             }
         }
         Ok(transposed)

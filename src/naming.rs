@@ -14,21 +14,41 @@ use magnetar_runtime::production_model_ingestion::ProductionIngestionError;
 
 /// Normalizes one real Hugging Face Qwen tensor name into its canonical
 /// Model Artifact name, or rejects it structurally:
-/// - a bias tensor (`*.bias`) is rejected with `UnsupportedFormat`: the
-///   production Qwen Component's graph does not yet add a bias term to
-///   any projection, so silently dropping one would produce numerically
-///   wrong results rather than a fail-closed error (a real, separate gap
-///   this change's non-goals do not claim to close).
+/// - `self_attn.{q,k,v}_proj.bias` is accepted and canonicalized to
+///   `layers.N.self_attn.{q,k,v}_bias`: a real Qwen2/2.5 architectural
+///   default (every such checkpoint declares these three), which the
+///   production Qwen Component's graph adds via a broadcast `add` node
+///   after the matching projection's matmul.
+/// - every other bias tensor (`o_proj.bias`, any MLP bias, `lm_head.bias`)
+///   is rejected with `UnsupportedFormat`: the production Qwen Component's
+///   graph does not add a bias term to those projections, so silently
+///   dropping one would produce numerically wrong results rather than a
+///   fail-closed error (a real, separate gap this change's non-goals do
+///   not claim to close).
 /// - an unrecognized name is rejected with `MalformedMetadata` naming it,
 ///   rather than passed through unrecognized (which would fail later,
 ///   opaquely, only when the Component's `weight-edge` call cannot find
 ///   it).
 pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionError> {
     if let Some(suffix) = raw.strip_suffix(".bias") {
+        if let Some(layer_suffix) = suffix.strip_prefix("model.layers.")
+            && let Some((layer_index, rest)) = layer_suffix.split_once('.')
+            && layer_index.parse::<u64>().is_ok()
+        {
+            let canonical_bias_suffix = match rest {
+                "self_attn.q_proj" => Some("self_attn.q_bias"),
+                "self_attn.k_proj" => Some("self_attn.k_bias"),
+                "self_attn.v_proj" => Some("self_attn.v_bias"),
+                _ => None,
+            };
+            if let Some(canonical_bias_suffix) = canonical_bias_suffix {
+                return Ok(format!("layers.{layer_index}.{canonical_bias_suffix}"));
+            }
+        }
         return Err(ProductionIngestionError::UnsupportedFormat {
             reason: format!(
                 "tensor '{raw}' is a bias term for '{suffix}'; the production Qwen Component \
-                 graph does not yet support attention/MLP bias terms"
+                 graph only supports attention q/k/v_proj bias terms"
             ),
         });
     }
@@ -122,8 +142,34 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bias_tensors() {
-        let error = normalize_tensor_name("model.layers.0.self_attn.q_proj.bias").unwrap_err();
+    fn normalizes_qkv_bias_tensors() {
+        assert_eq!(
+            normalize_tensor_name("model.layers.0.self_attn.q_proj.bias").unwrap(),
+            "layers.0.self_attn.q_bias"
+        );
+        assert_eq!(
+            normalize_tensor_name("model.layers.0.self_attn.k_proj.bias").unwrap(),
+            "layers.0.self_attn.k_bias"
+        );
+        assert_eq!(
+            normalize_tensor_name("model.layers.7.self_attn.v_proj.bias").unwrap(),
+            "layers.7.self_attn.v_bias"
+        );
+    }
+
+    #[test]
+    fn rejects_bias_tensors_outside_qkv() {
+        let error = normalize_tensor_name("model.layers.0.self_attn.o_proj.bias").unwrap_err();
+        assert!(matches!(
+            error,
+            ProductionIngestionError::UnsupportedFormat { .. }
+        ));
+        let error = normalize_tensor_name("model.layers.0.mlp.gate_proj.bias").unwrap_err();
+        assert!(matches!(
+            error,
+            ProductionIngestionError::UnsupportedFormat { .. }
+        ));
+        let error = normalize_tensor_name("lm_head.bias").unwrap_err();
         assert!(matches!(
             error,
             ProductionIngestionError::UnsupportedFormat { .. }

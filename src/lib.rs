@@ -102,7 +102,7 @@ impl ProductionModelArtifactIngestor for HuggingFaceIngestor {
                 part: format!("{CONFIG_FILE_NAME} ({error})"),
             }
         })?;
-        let normalized_config = config::parse(&config_bytes)?;
+        let mut normalized_config = config::parse(&config_bytes)?;
 
         let (mut tensors, shards, payload_source) = weights::discover_and_parse_weights(source)?;
         if tensors.is_empty() {
@@ -110,6 +110,18 @@ impl ProductionModelArtifactIngestor for HuggingFaceIngestor {
                 reason: "no tensors were discovered in this bundle's weight files".into(),
             });
         }
+        // `config.json` never declares attention bias for real Qwen2/2.5
+        // checkpoints (a model-class default, not a config field) -- the
+        // only real evidence is whether the bundle's own Safetensors
+        // header actually declares a `q_bias` tensor (canonicalized by
+        // `naming.rs` from `self_attn.q_proj.bias`). `k_bias`/`v_bias`
+        // always accompany it on every real such checkpoint; checking one
+        // is sufficient and keeps this a simple presence check rather
+        // than a partial-bias inconsistency policy this change does not
+        // need.
+        normalized_config.architecture_config.attention_bias = tensors
+            .iter()
+            .any(|tensor| tensor.name.ends_with("self_attn.q_bias"));
 
         // Every 2D projection weight (q/k/v/o_proj, gate/up/down_proj,
         // lm_head) is stored (and therefore discovered) as `nn.Linear`'s

@@ -646,13 +646,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_bias_tensor() {
+    fn rejects_a_bias_tensor_outside_qkv() {
         let dir = tempfile::tempdir().unwrap();
         write_safetensors_file(
             &dir.path().join(SINGLE_FILE_NAME),
             &[
                 ("model.embed_tokens.weight", &[1.0]),
-                ("model.layers.0.self_attn.q_proj.bias", &[0.0]),
+                ("model.layers.0.self_attn.o_proj.bias", &[0.0]),
             ],
         );
         let source = ProductionModelSource::authorized_local_bundle(
@@ -667,5 +667,32 @@ mod tests {
             error,
             ProductionIngestionError::UnsupportedFormat { .. }
         ));
+    }
+
+    /// Real Qwen2/2.5 checkpoints declare `self_attn.{q,k,v}_proj.bias`
+    /// (task 10.5's sibling QKV bias support) -- these must be accepted
+    /// and canonicalized, not rejected like every other bias tensor.
+    #[test]
+    fn accepts_qkv_bias_tensors() {
+        let dir = tempfile::tempdir().unwrap();
+        write_safetensors_file(
+            &dir.path().join(SINGLE_FILE_NAME),
+            &[
+                ("model.embed_tokens.weight", &[1.0]),
+                ("model.layers.0.self_attn.q_proj.bias", &[2.0]),
+                ("model.layers.0.self_attn.k_proj.bias", &[3.0]),
+                ("model.layers.0.self_attn.v_proj.bias", &[4.0]),
+            ],
+        );
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        let (tensors, _shards, _payload_source) = discover_and_parse_weights(&source).unwrap();
+        let names: std::collections::BTreeSet<String> =
+            tensors.iter().map(|t| t.name.clone()).collect();
+        assert!(names.contains("layers.0.self_attn.q_bias"));
+        assert!(names.contains("layers.0.self_attn.k_bias"));
+        assert!(names.contains("layers.0.self_attn.v_bias"));
     }
 }

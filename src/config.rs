@@ -181,6 +181,13 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
             .and_then(|scaling| scaling.factor)
             .map(|value| value as f32),
         tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(false),
+        // `config.json` never declares this for real Qwen2/2.5 checkpoints
+        // (it's an architectural default of the model class, not a
+        // config field) -- `false` here is a placeholder `lib.rs::ingest`
+        // overwrites once real weight discovery has actually looked for
+        // `self_attn.{q,k,v}_proj` bias tensors, the only real evidence
+        // this ever needs.
+        attention_bias: false,
         bos_token_id: raw.bos_token_id,
         eos_token_id: raw.eos_token_id.as_ref().and_then(RawEosTokenId::first),
     };

@@ -59,6 +59,12 @@ pub struct DerivedLmHeadPayloadSource<S> {
     token_embedding_range: ProductionPayloadRange,
     vocab_size: u64,
     hidden_size: u64,
+    /// `token_embedding`'s real per-element storage width in bytes (4 for
+    /// F32, 2 for F16/BF16 -- real Qwen2/2.5 checkpoints commonly store
+    /// BF16). Transposing must preserve each element's own byte width,
+    /// not assume F32 (`weight_layout.rs`'s `TransposingPayloadSource`
+    /// has the identical requirement and reasoning).
+    element_bytes: u64,
 }
 
 impl<S> DerivedLmHeadPayloadSource<S> {
@@ -80,6 +86,7 @@ impl<S> DerivedLmHeadPayloadSource<S> {
             },
             vocab_size,
             hidden_size,
+            element_bytes: token_embedding.storage_dtype.descriptor().size_bytes(),
         })
     }
 }
@@ -101,26 +108,28 @@ impl<S: ProductionArtifactPayloadSource> ProductionArtifactPayloadSource
             .ok_or_else(|| ProductionIngestionError::MalformedMetadata {
                 reason: "derived lm_head element count overflows".into(),
             })?;
-        if bytes.len() as u64 != element_count.saturating_mul(4) {
+        if bytes.len() as u64 != element_count.saturating_mul(self.element_bytes) {
             return Err(ProductionIngestionError::MalformedMetadata {
                 reason: format!(
-                    "token_embedding byte length {} does not match {}x{} F32 elements while \
-                     deriving lm_head",
+                    "token_embedding byte length {} does not match {}x{} elements at {} \
+                     bytes/element while deriving lm_head",
                     bytes.len(),
                     self.vocab_size,
-                    self.hidden_size
+                    self.hidden_size,
+                    self.element_bytes
                 ),
             });
         }
         let rows = self.vocab_size as usize;
         let cols = self.hidden_size as usize;
+        let element_bytes = self.element_bytes as usize;
         let mut transposed = vec![0u8; bytes.len()];
         for row in 0..rows {
             for col in 0..cols {
-                let source_offset = (row * cols + col) * 4;
-                let dest_offset = (col * rows + row) * 4;
-                transposed[dest_offset..dest_offset + 4]
-                    .copy_from_slice(&bytes[source_offset..source_offset + 4]);
+                let source_offset = (row * cols + col) * element_bytes;
+                let dest_offset = (col * rows + row) * element_bytes;
+                transposed[dest_offset..dest_offset + element_bytes]
+                    .copy_from_slice(&bytes[source_offset..source_offset + element_bytes]);
             }
         }
         Ok(transposed)

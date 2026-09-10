@@ -155,6 +155,17 @@ impl HuggingFaceTokenizer {
     /// identity metadata needed to construct a [`TokenizerMetadata`].
     /// Validates vocabulary size and BOS/EOS/PAD special-token
     /// compatibility against `expected_vocab_size` (task 9.3).
+    ///
+    /// `expected_vocab_size` is the embedding table's row count (`config.
+    /// json`'s `vocab_size`, i.e. `token_embedding`'s declared shape), not
+    /// necessarily the tokenizer's own vocabulary size exactly: real Qwen2/
+    /// 2.5 checkpoints pad the embedding table to a hardware-friendly
+    /// round number (e.g. Qwen2.5-0.5B-Instruct declares `vocab_size:
+    /// 151936` while its real `tokenizer.json` vocabulary is `151665` --
+    /// the extra rows are simply unused padding, never referenced by any
+    /// real token id). A tokenizer vocabulary *larger* than the embedding
+    /// table is the genuine incompatibility this rejects: a token id it
+    /// could produce would then index past `token_embedding`'s real rows.
     pub fn from_bytes(
         tokenizer_json: &[u8],
         tokenizer_config: Option<&TokenizerConfigMetadata>,
@@ -168,12 +179,12 @@ impl HuggingFaceTokenizer {
         })?;
         let vocabulary_size = inner.get_vocab_size(true) as u32;
         if let Some(expected) = expected_vocab_size
-            && u64::from(vocabulary_size) != expected
+            && u64::from(vocabulary_size) > expected
         {
             return Err(ProductionIngestionError::MalformedMetadata {
                 reason: format!(
-                    "tokenizer.json vocabulary size {vocabulary_size} does not match the \
-                     model's declared vocab_size {expected}"
+                    "tokenizer.json vocabulary size {vocabulary_size} exceeds the model's \
+                     declared vocab_size {expected} (embedding table row count)"
                 ),
             });
         }
@@ -451,12 +462,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_vocabulary_size_mismatch() {
+    fn rejects_a_tokenizer_vocabulary_larger_than_the_declared_embedding_table() {
+        // tiny_tokenizer_json declares 6 real token ids (0..=5); a
+        // declared embedding table of only 3 rows cannot hold them all --
+        // a genuine incompatibility, not padding.
         let error = match HuggingFaceTokenizer::from_bytes(
             &tiny_tokenizer_json(),
             None,
             "test-tokenizer",
-            Some(999),
+            Some(3),
         ) {
             Err(error) => error,
             Ok(_) => panic!("expected a vocabulary size mismatch error"),
@@ -465,6 +479,17 @@ mod tests {
             error,
             ProductionIngestionError::MalformedMetadata { .. }
         ));
+    }
+
+    /// Real Qwen2/2.5 checkpoints pad the embedding table beyond the
+    /// tokenizer's real vocabulary (e.g. Qwen2.5-0.5B-Instruct: tokenizer
+    /// vocabulary 151665, declared `vocab_size` 151936) -- a tokenizer
+    /// vocabulary *smaller* than the declared embedding table is real,
+    /// common, and must load successfully, not be rejected as a mismatch.
+    #[test]
+    fn accepts_a_tokenizer_vocabulary_smaller_than_the_declared_embedding_table() {
+        HuggingFaceTokenizer::from_bytes(&tiny_tokenizer_json(), None, "test-tokenizer", Some(999))
+            .expect("a padded embedding table larger than the real tokenizer vocabulary is valid");
     }
 
     #[test]
