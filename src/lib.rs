@@ -19,12 +19,14 @@
 //! Loading may materialize anything from it.
 
 mod config;
+mod derived_lm_head;
 mod naming;
 mod tokenizer;
 mod weight_layout;
 mod weights;
 
 pub use config::{NormalizedHfConfig, parse as parse_config};
+pub use derived_lm_head::{DerivedLmHeadPayloadSource, append_synthetic_lm_head_if_tied};
 pub use naming::normalize_tensor_name;
 pub use tokenizer::{
     HuggingFaceTokenizer, parse_generation_config, parse_tokenizer_config,
@@ -116,10 +118,43 @@ impl ProductionModelArtifactIngestor for HuggingFaceIngestor {
         // `weight_layout.rs`. `token_embedding` (a lookup table) and the
         // 1D normalization vectors are excluded structurally, never
         // transposed.
-        let payload_source: Arc<dyn ProductionArtifactPayloadSource> = Arc::new(
-            weight_layout::TransposingPayloadSource::new(payload_source, &tensors),
-        );
+        let transposing_source =
+            weight_layout::TransposingPayloadSource::new(payload_source, &tensors);
         weight_layout::swap_declared_projection_shapes(&mut tensors);
+
+        // A real `tie_word_embeddings: true` checkpoint genuinely omits
+        // `lm_head.weight` -- the model reuses `token_embedding` for the
+        // output projection. Derive it here, at load time, from the real
+        // already-discovered `token_embedding` tensor rather than
+        // requiring the Component to special-case a missing weight
+        // (`implement-production-qwen-model-loading` task 10.5).
+        let token_embedding = tensors
+            .iter()
+            .find(|tensor| tensor.name == "token_embedding")
+            .cloned();
+        let synthetic_lm_head_added = derived_lm_head::append_synthetic_lm_head_if_tied(
+            &mut tensors,
+            normalized_config.architecture_config.tie_word_embeddings,
+        );
+        let payload_source: Arc<dyn ProductionArtifactPayloadSource> = if synthetic_lm_head_added {
+            let token_embedding = token_embedding.expect(
+                "append_synthetic_lm_head_if_tied only returns true when a token_embedding \
+                 tensor was found",
+            );
+            Arc::new(
+                derived_lm_head::DerivedLmHeadPayloadSource::new(
+                    transposing_source,
+                    &token_embedding,
+                )
+                .ok_or_else(|| ProductionIngestionError::MalformedMetadata {
+                    reason: "token_embedding is missing the offset/size/shape metadata needed \
+                             to derive a tied lm_head"
+                        .into(),
+                })?,
+            )
+        } else {
+            Arc::new(transposing_source)
+        };
 
         let storage_dtype = tensors.first().map(|tensor| tensor.storage_dtype);
         let mut supported_compute_dtypes = BTreeSet::new();
@@ -341,6 +376,97 @@ mod tests {
         // The manifest is independently well-formed per the existing
         // Model Artifact contract.
         result.manifest.validate().expect("manifest validates");
+    }
+
+    #[test]
+    fn derives_lm_head_end_to_end_when_tied_and_absent() {
+        // A real tied checkpoint (`tie_word_embeddings: true`) genuinely
+        // omits `lm_head.weight` from its bundle -- this proves ingestion
+        // still produces a usable `lm_head` tensor and correct bytes for
+        // it, driven only by the real `token_embedding` tensor this
+        // bundle does declare (task 10.5). Non-square
+        // vocab_size/hidden_size (3 vs 2) so a transpose bug would not be
+        // masked by a square shape.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config =
+            serde_json::from_slice::<serde_json::Value>(&qwen2_config_bytes()).unwrap();
+        config["hidden_size"] = serde_json::json!(2);
+        config["vocab_size"] = serde_json::json!(3);
+        config["num_attention_heads"] = serde_json::json!(1);
+        config["num_key_value_heads"] = serde_json::json!(1);
+        fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+
+        // token_embedding stored [vocab=3, hidden=2] row-major:
+        // [[1,2],[3,4],[5,6]]. No lm_head.weight in this bundle at all.
+        let mut header = serde_json::Map::new();
+        let mut data = Vec::new();
+        for (name, values) in [
+            (
+                "model.embed_tokens.weight",
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            ),
+            ("model.norm.weight", vec![1.0, 1.0]),
+        ] {
+            let start = data.len() as u64;
+            for value in values {
+                data.extend_from_slice(&(value as f32).to_le_bytes());
+            }
+            let end = data.len() as u64;
+            let shape: Vec<u64> = if name == "model.embed_tokens.weight" {
+                vec![3, 2]
+            } else {
+                vec![2]
+            };
+            header.insert(
+                name.to_string(),
+                serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [start, end]}),
+            );
+        }
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut file = fs::File::create(dir.path().join("model.safetensors")).unwrap();
+        file.write_all(&(header_bytes.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header_bytes).unwrap();
+        file.write_all(&data).unwrap();
+
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        let result = HuggingFaceIngestor::new()
+            .ingest(&source)
+            .expect("bundle ingests");
+        result.manifest.validate().expect("manifest validates");
+
+        let lm_head = result
+            .manifest
+            .tensors
+            .iter()
+            .find(|tensor| tensor.name == "lm_head")
+            .expect("a synthetic lm_head tensor was added");
+        assert_eq!(lm_head.shape, vec![2, 3], "hidden x vocab, as expected");
+        assert!(lm_head.digest.is_none());
+
+        let range = magnetar_runtime::production_model_ingestion::ProductionPayloadRange {
+            identity: "lm_head".to_string(),
+            offset: lm_head.offset_bytes.unwrap(),
+            length: lm_head.size_bytes.unwrap(),
+            digest: None,
+        };
+        let bytes = result.payload_source.read_payload(&range).unwrap();
+        let values: Vec<f32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect();
+        // Transpose of [[1,2],[3,4],[5,6]] (3x2) is (2x3):
+        // [[1,3,5],[2,4,6]].
+        assert_eq!(values, vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0]);
     }
 
     #[test]
