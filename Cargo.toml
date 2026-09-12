@@ -33,6 +33,13 @@ sha2 = "0.10"
 # this external crate is the only place in the workspace that depends on
 # it.
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+# Real chat-template rendering (`close-tachyon-scope-audit-gaps` task
+# group 2): real Hugging Face `tokenizer_config.json` chat templates are
+# Jinja2 templates; `minijinja` is a small, actively maintained Jinja2-
+# compatible engine, the de facto standard for this exact job in the
+# Rust LLM-serving ecosystem. Kept out of `magnetar-runtime` entirely --
+# this is a Hugging Face convention, not a portable Magnetar concept.
+minijinja = { version = "2", default-features = false, features = ["builtins", "serde"] }
 
 [dev-dependencies]
 tempfile = "3"

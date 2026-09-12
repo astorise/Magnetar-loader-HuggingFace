@@ -18,6 +18,7 @@
 //! `ModelTrustStore::evaluate` like any other manifest before Model
 //! Loading may materialize anything from it.
 
+mod chat_template;
 mod config;
 mod derived_lm_head;
 mod naming;
@@ -25,6 +26,7 @@ mod tokenizer;
 mod weight_layout;
 mod weights;
 
+pub use chat_template::HuggingFaceChatTemplateFormatter;
 pub use config::{NormalizedHfConfig, parse as parse_config};
 pub use derived_lm_head::{DerivedLmHeadPayloadSource, append_synthetic_lm_head_if_tied};
 pub use naming::normalize_tensor_name;
@@ -242,6 +244,36 @@ impl ProductionModelArtifactIngestor for HuggingFaceIngestor {
             tokenizer_reference = Some("tokenizer".to_string());
         }
 
+        // A real chat template (when the bundle declares one) is recorded
+        // the same way "tokenizer"/"tokenizer_config" already are: a named
+        // part carrying a real digest over its own content, referenced by
+        // name from the manifest -- `ModelManifest::validate`'s `chat-
+        // template` reference check requires exactly this shape (task
+        // group 1). The raw template text itself is not carried on the
+        // manifest (parts are identity/provenance, not payload, matching
+        // "tokenizer"/"tokenizer_config"'s own convention) -- a caller
+        // that wants to actually render it reads `tokenizer_config.json`
+        // again through this same authorized `source` and calls
+        // `chat_template::load_chat_template_formatter`, exactly how a
+        // caller already re-reads `tokenizer.json` to build the real
+        // `Tokenizer` today.
+        let chat_template_reference = tokenizer_config_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.chat_template_reference.as_deref())
+            .map(|template| {
+                parts.insert(
+                    "chat_template".to_string(),
+                    ModelArtifactPart {
+                        name: "chat_template".to_string(),
+                        kind: ModelArtifactKind::ChatTemplate,
+                        digest: ModelDigest::sha256(template.as_bytes()),
+                        size_bytes: Some(template.len() as u64),
+                        required: false,
+                    },
+                );
+                "chat_template".to_string()
+            });
+
         let generation =
             if let Ok(generation_config_path) = source.resolve(GENERATION_CONFIG_FILE_NAME) {
                 let bytes = fs::read(&generation_config_path).map_err(|error| {
@@ -284,7 +316,7 @@ impl ProductionModelArtifactIngestor for HuggingFaceIngestor {
             tokenizer_config: tokenizer_config_metadata
                 .as_ref()
                 .and(Some("tokenizer".to_string())),
-            chat_template: None,
+            chat_template: chat_template_reference,
             prompt_template: None,
             generation,
             quantization: None,
@@ -377,6 +409,10 @@ mod tests {
         let config = result.manifest.architecture_config.clone().unwrap();
         assert_eq!(config.hidden_size, 8);
         assert_eq!(config.num_hidden_layers, 1);
+        assert!(
+            result.manifest.chat_template.is_none(),
+            "this bundle declares no tokenizer_config.json, so no chat template reference"
+        );
 
         // Parsing/normalizing alone never grants trust (Decision 2).
         let trust = ModelTrustStore::default().evaluate(&result.manifest);
@@ -387,6 +423,67 @@ mod tests {
 
         // The manifest is independently well-formed per the existing
         // Model Artifact contract.
+        result.manifest.validate().expect("manifest validates");
+    }
+
+    /// A real chat template, when declared, is threaded into the manifest
+    /// as a named, digested part -- the same shape "tokenizer"/
+    /// "tokenizer_config" already use -- not discarded (task 1.1).
+    #[test]
+    fn threads_a_declared_chat_template_into_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), qwen2_config_bytes()).unwrap();
+        write_tiny_safetensors(&dir.path().join("model.safetensors"));
+        let template = "{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}";
+        fs::write(
+            dir.path().join("tokenizer_config.json"),
+            serde_json::json!({"chat_template": template}).to_string(),
+        )
+        .unwrap();
+        // `tokenizer_config`'s own reference in the manifest points at the
+        // "tokenizer" part (see `ingest`'s own construction below), so a
+        // real `tokenizer.json` must also be present for `validate` to
+        // resolve it -- unrelated to this test's actual subject (the
+        // chat-template reference), just a real bundle requirement.
+        fs::write(
+            dir.path().join("tokenizer.json"),
+            serde_json::json!({
+                "version": "1.0",
+                "model": {"type": "WordLevel", "vocab": {"a": 0}, "unk_token": "a"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        let result = HuggingFaceIngestor::new()
+            .ingest(&source)
+            .expect("bundle ingests");
+
+        assert_eq!(
+            result.manifest.chat_template.as_deref(),
+            Some("chat_template")
+        );
+        let part = result
+            .manifest
+            .parts
+            .get("chat_template")
+            .expect("a chat_template part was inserted");
+        assert_eq!(
+            part.digest,
+            magnetar_runtime::model::ModelDigest::sha256(template.as_bytes())
+        );
+        assert_eq!(part.size_bytes, Some(template.len() as u64));
+        assert!(
+            !part.required,
+            "a declared chat template is optional metadata, not a mandatory artifact part"
+        );
+
+        // The reference is real: `validate` requires the named part to
+        // actually exist, which it does.
         result.manifest.validate().expect("manifest validates");
     }
 
