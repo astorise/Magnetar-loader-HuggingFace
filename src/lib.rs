@@ -21,6 +21,7 @@
 mod chat_template;
 mod config;
 mod derived_lm_head;
+mod gptq;
 mod naming;
 mod tokenizer;
 mod weight_layout;
@@ -106,7 +107,8 @@ impl ProductionModelArtifactIngestor for HuggingFaceIngestor {
         })?;
         let mut normalized_config = config::parse(&config_bytes)?;
 
-        let (mut tensors, shards, payload_source) = weights::discover_and_parse_weights(source)?;
+        let (mut tensors, shards, gptq_projection_names, payload_source) =
+            weights::discover_and_parse_weights(source)?;
         if tensors.is_empty() {
             return Err(ProductionIngestionError::MalformedMetadata {
                 reason: "no tensors were discovered in this bundle's weight files".into(),
@@ -131,10 +133,15 @@ impl ProductionModelArtifactIngestor for HuggingFaceIngestor {
         // expects [in_features, out_features] instead -- see
         // `weight_layout.rs`. `token_embedding` (a lookup table) and the
         // 1D normalization vectors are excluded structurally, never
-        // transposed.
-        let transposing_source =
-            weight_layout::TransposingPayloadSource::new(payload_source, &tensors);
-        weight_layout::swap_declared_projection_shapes(&mut tensors);
+        // transposed -- as are any GPTQ-dequantized projections
+        // (`gptq_projection_names`), already `[in_features, out_features]`
+        // by construction (`gptq.rs`).
+        let transposing_source = weight_layout::TransposingPayloadSource::new(
+            payload_source,
+            &tensors,
+            &gptq_projection_names,
+        );
+        weight_layout::swap_declared_projection_shapes(&mut tensors, &gptq_projection_names);
 
         // A real `tie_word_embeddings: true` checkpoint genuinely omits
         // `lm_head.weight` -- the model reuses `token_embedding` for the
@@ -617,5 +624,189 @@ mod tests {
     #[test]
     fn ingestor_id_is_stable() {
         assert_eq!(HuggingFaceIngestor::new().ingestor_id(), INGESTOR_ID);
+    }
+
+    /// End-to-end proof that a GPTQ-quantized bundle ingests correctly
+    /// through the full `ingest()` pipeline, not just the low-level
+    /// dequantization math (`gptq.rs`'s own tests, including the real
+    /// public-checkpoint comparison). Builds a small bundle with one
+    /// GPTQ-quantized projection (`self_attn.q_proj`, hand-computed
+    /// values, 1 quantization group) alongside two plain `F32` tensors,
+    /// and asserts: the manifest carries `layers.0.self_attn.q_proj` at
+    /// its real, already-Runtime-oriented `[in_features, out_features]`
+    /// shape (never transposed a second time -- `weight_layout.rs`'s
+    /// GPTQ exclusion), and reading its payload returns the correctly
+    /// dequantized bytes.
+    #[test]
+    fn ingests_a_gptq_quantized_bundle_end_to_end() {
+        fn pack_i32(nibbles: &[i32]) -> i32 {
+            let mut value: i32 = 0;
+            for (index, nibble) in nibbles.iter().enumerate() {
+                value |= (nibble & 0xF) << (4 * index);
+            }
+            value
+        }
+        fn f16_bits_from_f32(value: f32) -> u16 {
+            let bits = value.to_bits();
+            let sign = (bits >> 16) & 0x8000;
+            let exponent = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
+            let mantissa = (bits >> 13) & 0x3FF;
+            (sign | ((exponent as u32) << 10) | mantissa) as u16
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: serde_json::Value = serde_json::from_slice(&qwen2_config_bytes()).unwrap();
+        config["hidden_size"] = serde_json::json!(8);
+        config["intermediate_size"] = serde_json::json!(8);
+        config["num_attention_heads"] = serde_json::json!(1);
+        config["num_key_value_heads"] = serde_json::json!(1);
+        config["vocab_size"] = serde_json::json!(4);
+        config["tie_word_embeddings"] = serde_json::json!(false);
+        fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+
+        // One GPTQ group covering all 8 input channels, code pattern
+        // [8,9,10,11,12,13,14,15] (zero_code=7, so quant_code-(zero+1) =
+        // [0,1,...,7]) repeated identically for every one of the 8 output
+        // columns, scale=0.1 -- the same hand-built shape `gptq.rs`'s own
+        // unit test already verifies the arithmetic for, exercised here
+        // through the real file-based ingestion path instead.
+        let packed_row = pack_i32(&[8, 9, 10, 11, 12, 13, 14, 15]);
+        let qweight_bytes: Vec<u8> = std::iter::repeat_n(packed_row, 8)
+            .flat_map(i32::to_le_bytes)
+            .collect();
+        let qzeros_bytes: Vec<u8> = pack_i32(&[7; 8]).to_le_bytes().to_vec();
+        let scales_bytes: Vec<u8> = std::iter::repeat_n(f16_bits_from_f32(0.1), 8)
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let gidx_bytes: Vec<u8> = std::iter::repeat_n(0i32, 8)
+            .flat_map(i32::to_le_bytes)
+            .collect();
+
+        let mut header = serde_json::Map::new();
+        let mut data = Vec::new();
+        let mut push = |header: &mut serde_json::Map<String, serde_json::Value>,
+                        name: &str,
+                        dtype: &str,
+                        shape: Vec<u64>,
+                        bytes: &[u8]| {
+            let start = data.len() as u64;
+            data.extend_from_slice(bytes);
+            let end = data.len() as u64;
+            header.insert(
+                name.to_string(),
+                serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [start, end]}),
+            );
+        };
+        push(
+            &mut header,
+            "model.embed_tokens.weight",
+            "F32",
+            vec![4, 8],
+            &[0u8; 4 * 8 * 4],
+        );
+        push(
+            &mut header,
+            "model.norm.weight",
+            "F32",
+            vec![8],
+            &1.0f32.to_le_bytes().repeat(8),
+        );
+        push(
+            &mut header,
+            "model.layers.0.self_attn.q_proj.qweight",
+            "I32",
+            vec![1, 8],
+            &qweight_bytes,
+        );
+        push(
+            &mut header,
+            "model.layers.0.self_attn.q_proj.qzeros",
+            "I32",
+            vec![1, 1],
+            &qzeros_bytes,
+        );
+        push(
+            &mut header,
+            "model.layers.0.self_attn.q_proj.scales",
+            "F16",
+            vec![1, 8],
+            &scales_bytes,
+        );
+        push(
+            &mut header,
+            "model.layers.0.self_attn.q_proj.g_idx",
+            "I32",
+            vec![8],
+            &gidx_bytes,
+        );
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut file = fs::File::create(dir.path().join("model.safetensors")).unwrap();
+        file.write_all(&(header_bytes.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header_bytes).unwrap();
+        file.write_all(&data).unwrap();
+
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        let result = HuggingFaceIngestor::new()
+            .ingest(&source)
+            .expect("a GPTQ-quantized bundle ingests");
+
+        let q_proj = result
+            .manifest
+            .tensors
+            .iter()
+            .find(|tensor| tensor.name == "layers.0.self_attn.q_proj")
+            .expect("the GPTQ projection is present under its canonical name");
+        assert_eq!(
+            q_proj.shape,
+            vec![8, 8],
+            "GPTQ's own packing already puts [in_features, out_features] first -- \
+             the transpose exclusion must have kept this from being swapped a second time"
+        );
+        assert_eq!(q_proj.storage_dtype, ModelDType::F32);
+        assert!(
+            !result
+                .manifest
+                .tensors
+                .iter()
+                .any(|tensor| tensor.name.contains("qweight") || tensor.name.contains("qzeros")),
+            "the four raw GPTQ siblings must not leak into the final manifest"
+        );
+
+        let range = magnetar_runtime::production_model_ingestion::ProductionPayloadRange {
+            identity: q_proj.name.clone(),
+            offset: q_proj.offset_bytes.unwrap(),
+            length: q_proj.size_bytes.unwrap(),
+            digest: None,
+        };
+        let bytes = result.payload_source.read_payload(&range).unwrap();
+        let values: Vec<f32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect();
+        assert_eq!(values.len(), 64);
+        // Row-major [in_features=8, out_features=8]: input channel i's
+        // code is (i-th nibble of the shared packed value) - 8, scaled by
+        // 0.1 -- identical across every output column, matching the
+        // hand-built fixture above.
+        for i in 0..8usize {
+            let expected = 0.1 * (i as f32);
+            for o in 0..8usize {
+                let actual = values[i * 8 + o];
+                assert!(
+                    (actual - expected).abs() < 1e-3,
+                    "value[{i}][{o}]: got {actual}, expected {expected}"
+                );
+            }
+        }
     }
 }

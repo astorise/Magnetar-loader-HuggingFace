@@ -22,7 +22,7 @@ use magnetar_runtime::model::ModelTensorMetadata;
 use magnetar_runtime::production_model_ingestion::{
     ProductionArtifactPayloadSource, ProductionIngestionError, ProductionPayloadRange,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Whether `canonical_name` (already normalized -- see `naming.rs`) names
 /// a projection weight this Runtime expects transposed relative to how
@@ -59,8 +59,21 @@ fn is_transposed_projection(canonical_name: &str) -> bool {
 /// separate, later check is skipped rather than wrongly failing --
 /// consistent with `ModelTensorMetadata::digest`'s own "`None` means no
 /// digest was declared" precedent, not "no content required".
-pub fn swap_declared_projection_shapes(tensors: &mut [ModelTensorMetadata]) {
+///
+/// `already_oriented` names tensors this transpose must skip even though
+/// their canonical name matches a projection -- a GPTQ-dequantized
+/// projection (`gptq.rs`) is already `[in_features, out_features]` by
+/// construction (GPTQ's own `qweight` packs the input dimension first),
+/// so swapping its declared shape a second time would be wrong, not
+/// redundant.
+pub fn swap_declared_projection_shapes(
+    tensors: &mut [ModelTensorMetadata],
+    already_oriented: &BTreeSet<String>,
+) {
     for tensor in tensors.iter_mut() {
+        if already_oriented.contains(&tensor.name) {
+            continue;
+        }
         if is_transposed_projection(&tensor.name) && tensor.shape.len() == 2 {
             tensor.shape.swap(0, 1);
             tensor.digest = None;
@@ -98,11 +111,22 @@ impl<S> TransposingPayloadSource<S> {
     /// Builds the wrapper from `tensors`' state *before*
     /// [`swap_declared_projection_shapes`] is applied to them -- call this
     /// first, capture the map, then swap the caller's own tensor list
-    /// separately.
-    pub fn new(inner: S, tensors: &[ModelTensorMetadata]) -> Self {
+    /// separately. `already_oriented` is the same exclusion set
+    /// `swap_declared_projection_shapes` takes -- a tensor named in it is
+    /// never transposed here either, keeping the declared shape and the
+    /// actual bytes consistent for a GPTQ-dequantized projection.
+    pub fn new(
+        inner: S,
+        tensors: &[ModelTensorMetadata],
+        already_oriented: &BTreeSet<String>,
+    ) -> Self {
         let original_shapes = tensors
             .iter()
-            .filter(|tensor| is_transposed_projection(&tensor.name) && tensor.shape.len() == 2)
+            .filter(|tensor| {
+                !already_oriented.contains(&tensor.name)
+                    && is_transposed_projection(&tensor.name)
+                    && tensor.shape.len() == 2
+            })
             .map(|tensor| {
                 (
                     tensor.name.clone(),
@@ -245,7 +269,7 @@ mod tests {
             with_digest(tensor("token_embedding", vec![16, 4])),
             with_digest(tensor("final_norm", vec![4])),
         ];
-        swap_declared_projection_shapes(&mut tensors);
+        swap_declared_projection_shapes(&mut tensors, &BTreeSet::new());
         assert_eq!(tensors[0].shape, vec![4, 16]);
         assert!(tensors[0].digest.is_none(), "lm_head's digest is cleared");
         assert_eq!(tensors[1].shape, vec![8, 4]);
@@ -275,7 +299,11 @@ mod tests {
         let original = vec![tensor("layers.0.mlp.down_proj", vec![4, 8])];
         let mut bytes_by_name = StdBTreeMap::new();
         bytes_by_name.insert("layers.0.mlp.down_proj".to_string(), raw.clone());
-        let source = TransposingPayloadSource::new(FixedPayloadSource(bytes_by_name), &original);
+        let source = TransposingPayloadSource::new(
+            FixedPayloadSource(bytes_by_name),
+            &original,
+            &BTreeSet::new(),
+        );
 
         let transposed = source
             .read_payload(&ProductionPayloadRange {
@@ -303,7 +331,11 @@ mod tests {
         let original = vec![tensor("layers.0.mlp.down_proj", vec![4, 8])];
         let mut bytes_by_name = StdBTreeMap::new();
         bytes_by_name.insert("token_embedding".to_string(), raw.clone());
-        let source = TransposingPayloadSource::new(FixedPayloadSource(bytes_by_name), &original);
+        let source = TransposingPayloadSource::new(
+            FixedPayloadSource(bytes_by_name),
+            &original,
+            &BTreeSet::new(),
+        );
         let unchanged = source
             .read_payload(&ProductionPayloadRange {
                 identity: "token_embedding".into(),
@@ -320,7 +352,11 @@ mod tests {
         let original = vec![tensor("lm_head", vec![2, 3])];
         let mut bytes_by_name = StdBTreeMap::new();
         bytes_by_name.insert("lm_head".to_string(), f32_bytes(&[1.0, 2.0]));
-        let source = TransposingPayloadSource::new(FixedPayloadSource(bytes_by_name), &original);
+        let source = TransposingPayloadSource::new(
+            FixedPayloadSource(bytes_by_name),
+            &original,
+            &BTreeSet::new(),
+        );
         let error = source
             .read_payload(&ProductionPayloadRange {
                 identity: "lm_head".into(),

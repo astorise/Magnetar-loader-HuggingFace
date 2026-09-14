@@ -149,21 +149,49 @@ fn parse_shard_file(
     Ok((bytes, artifact, start))
 }
 
+/// Either a plain Safetensors payload source, or one wrapping it to
+/// dequantize GPTQ-quantized projections on demand (`gptq.rs`) -- the one
+/// caller (`discover_and_parse_weights`) picks the variant, so every other
+/// caller (`lib.rs::ingest`) just sees one
+/// [`ProductionArtifactPayloadSource`] regardless of which real bundle
+/// shape it read.
+#[derive(Debug)]
+pub enum WeightsPayloadSource {
+    Plain(SafetensorsPayloadSource),
+    Gptq(crate::gptq::GptqDequantizingPayloadSource<SafetensorsPayloadSource>),
+}
+
+impl ProductionArtifactPayloadSource for WeightsPayloadSource {
+    fn read_payload(
+        &self,
+        range: &ProductionPayloadRange,
+    ) -> Result<Vec<u8>, ProductionIngestionError> {
+        match self {
+            Self::Plain(source) => source.read_payload(range),
+            Self::Gptq(source) => source.read_payload(range),
+        }
+    }
+}
+
+/// The tensor inventory, shard metadata (empty for the single-file case),
+/// the set of canonical names already in the Runtime's expected
+/// `[in_features, out_features]` orientation (GPTQ-dequantized
+/// projections -- `weight_layout.rs`'s transpose must skip these), and a
+/// bounded payload source -- [`discover_and_parse_weights`]'s own return
+/// shape, named so its signature stays readable.
+pub type DiscoveredWeights = (
+    Vec<ModelTensorMetadata>,
+    Vec<ModelShard>,
+    std::collections::BTreeSet<String>,
+    WeightsPayloadSource,
+);
+
 /// Discovers and parses this bundle's weight files -- single-file
 /// `model.safetensors` if present, else Hugging Face-style sharded
-/// `model.safetensors.index.json` plus `model-*-of-*.safetensors` shards
-/// -- returning the normalized tensor inventory, shard metadata (empty
-/// for the single-file case), and a bounded payload source.
+/// `model.safetensors.index.json` plus `model-*-of-*.safetensors` shards.
 pub fn discover_and_parse_weights(
     source: &ProductionModelSource,
-) -> Result<
-    (
-        Vec<ModelTensorMetadata>,
-        Vec<ModelShard>,
-        SafetensorsPayloadSource,
-    ),
-    ProductionIngestionError,
-> {
+) -> Result<DiscoveredWeights, ProductionIngestionError> {
     let (mut tensors, shards, mut payload_source) =
         if let Ok(index_path) = source.resolve(INDEX_FILE_NAME) {
             discover_sharded(source, &index_path)?
@@ -174,12 +202,22 @@ pub fn discover_and_parse_weights(
                 part: format!("{SINGLE_FILE_NAME} or {INDEX_FILE_NAME}"),
             });
         };
+
+    // GPTQ-quantized projections replace their raw `.qweight`/`.qzeros`/
+    // `.scales`/`.g_idx` quadruple with one synthesized `<prefix>.weight`
+    // placeholder here, *before* the renaming loop below runs (`naming.rs`
+    // does not recognize those raw suffixes and would reject them).
+    let gptq_projections = crate::gptq::extract_gptq_projections(&mut tensors)?;
+
     // Real Hugging Face tensor names (e.g. "model.layers.0.self_attn.
     // q_proj.weight") are normalized into the canonical Model Artifact
     // names the Qwen Component's weight-edge calls resolve directly --
     // both the returned inventory and the payload source's own lookup
     // keys are renamed together so `read_payload` stays reachable by the
-    // canonical identity Model Loading will actually request.
+    // canonical identity Model Loading will actually request. A GPTQ
+    // placeholder has no location entry (its real bytes come from its
+    // four raw siblings' own, untouched locations instead), so its
+    // `.remove()` below is a harmless no-op.
     let mut renamed_locations = BTreeMap::new();
     for tensor in &mut tensors {
         let canonical = crate::naming::normalize_tensor_name(&tensor.name)?;
@@ -188,8 +226,32 @@ pub fn discover_and_parse_weights(
         }
         tensor.name = canonical;
     }
-    payload_source.locations = renamed_locations;
-    Ok((tensors, shards, payload_source))
+    // `payload_source.locations` at this point holds only whatever the
+    // loop above never `.remove()`'d -- exactly the four raw GPTQ sibling
+    // entries per group (never present in `tensors`, so never targeted by
+    // `.remove()`), still keyed by their real raw names.
+    // `GptqDequantizingPayloadSource` reads them by those raw identities,
+    // so they must survive into the final map alongside the newly
+    // canonical-keyed ones -- `extend`, not an overwriting assignment,
+    // which would silently drop them and make every GPTQ read fail
+    // closed with `PayloadOutOfBounds` (a real bug caught by this crate's
+    // own end-to-end GPTQ ingestion test, not merely a theoretical risk).
+    payload_source.locations.extend(renamed_locations);
+
+    let gptq_canonical_names: std::collections::BTreeSet<String> = gptq_projections
+        .iter()
+        .map(crate::gptq::GptqProjection::canonical_name)
+        .map(str::to_string)
+        .collect();
+    let payload_source = if gptq_projections.is_empty() {
+        WeightsPayloadSource::Plain(payload_source)
+    } else {
+        WeightsPayloadSource::Gptq(crate::gptq::GptqDequantizingPayloadSource::new(
+            payload_source,
+            gptq_projections,
+        ))
+    };
+    Ok((tensors, shards, gptq_canonical_names, payload_source))
 }
 
 fn discover_single_file(
@@ -404,7 +466,8 @@ mod tests {
             ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
             dir.path().to_path_buf(),
         );
-        let (tensors, shards, payload_source) = discover_and_parse_weights(&source).unwrap();
+        let (tensors, shards, _gptq_names, payload_source) =
+            discover_and_parse_weights(&source).unwrap();
         assert_eq!(tensors.len(), 2);
         assert!(shards.is_empty());
 
@@ -455,7 +518,8 @@ mod tests {
             ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
             dir.path().to_path_buf(),
         );
-        let (tensors, shards, payload_source) = discover_and_parse_weights(&source).unwrap();
+        let (tensors, shards, _gptq_names, payload_source) =
+            discover_and_parse_weights(&source).unwrap();
         assert_eq!(tensors.len(), 2);
         assert_eq!(shards.len(), 2);
 
@@ -540,7 +604,8 @@ mod tests {
             ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
             dir.path().to_path_buf(),
         );
-        let (tensors, _shards, payload_source) = discover_and_parse_weights(&source).unwrap();
+        let (tensors, _shards, _gptq_names, payload_source) =
+            discover_and_parse_weights(&source).unwrap();
         let tensor_a = tensors
             .iter()
             .find(|t| t.name == "token_embedding")
@@ -615,7 +680,8 @@ mod tests {
             ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
             dir.path().to_path_buf(),
         );
-        let (tensors, _shards, payload_source) = discover_and_parse_weights(&source).unwrap();
+        let (tensors, _shards, _gptq_names, payload_source) =
+            discover_and_parse_weights(&source).unwrap();
         let names: std::collections::BTreeSet<String> =
             tensors.iter().map(|t| t.name.clone()).collect();
         assert_eq!(
@@ -688,7 +754,8 @@ mod tests {
             ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
             dir.path().to_path_buf(),
         );
-        let (tensors, _shards, _payload_source) = discover_and_parse_weights(&source).unwrap();
+        let (tensors, _shards, _gptq_names, _payload_source) =
+            discover_and_parse_weights(&source).unwrap();
         let names: std::collections::BTreeSet<String> =
             tensors.iter().map(|t| t.name.clone()).collect();
         assert!(names.contains("layers.0.self_attn.q_bias"));
