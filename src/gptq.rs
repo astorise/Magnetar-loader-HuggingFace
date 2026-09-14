@@ -301,6 +301,15 @@ pub fn extract_gptq_projections(
         let gidx_name = format!("{prefix}.g_idx");
 
         let find = |name: &str| tensors.iter().find(|tensor| tensor.name == name).cloned();
+        // `.g_idx` is GPTQ's own distinguishing signature (AWQ's `awq.rs`
+        // uses the identical `.qweight`/`.qzeros`/`.scales` triple but
+        // never declares one) -- its absence means this `.qweight` tensor
+        // belongs to a different quantization scheme entirely, not a
+        // malformed GPTQ one, so it is left untouched here for that
+        // scheme's own extractor to claim.
+        let Some(gidx_meta) = find(&gidx_name) else {
+            continue;
+        };
         let qweight_meta = find(&qweight_name).expect("this crate's own filter found it above");
         let qzeros_meta =
             find(&qzeros_name).ok_or_else(|| ProductionIngestionError::MalformedMetadata {
@@ -309,10 +318,6 @@ pub fn extract_gptq_projections(
         let scales_meta =
             find(&scales_name).ok_or_else(|| ProductionIngestionError::MalformedMetadata {
                 reason: format!("GPTQ tensor '{qweight_name}' has no matching '{scales_name}'"),
-            })?;
-        let gidx_meta =
-            find(&gidx_name).ok_or_else(|| ProductionIngestionError::MalformedMetadata {
-                reason: format!("GPTQ tensor '{qweight_name}' has no matching '{gidx_name}'"),
             })?;
 
         let [qweight_rows, out_features] = qweight_meta.shape[..] else {
@@ -576,6 +581,40 @@ mod tests {
             .unwrap();
         assert_eq!(placeholder.shape, vec![896, 896]);
         assert_eq!(placeholder.storage_dtype, ModelDType::F32);
+    }
+
+    /// A `.qweight` tensor with no `.g_idx` sibling is a different
+    /// quantization scheme's tensor (AWQ's `awq.rs` uses the identical
+    /// `.qweight`/`.qzeros`/`.scales` triple, but never `.g_idx`) --
+    /// `extract_gptq_projections` must leave it untouched for that
+    /// scheme's own extractor to claim, not error out or silently
+    /// misinterpret it as GPTQ.
+    #[test]
+    fn extract_gptq_projections_skips_a_qweight_tensor_with_no_g_idx_sibling() {
+        let tensor = |name: &str, shape: Vec<u64>| ModelTensorMetadata {
+            name: name.to_string(),
+            shape,
+            storage_dtype: ModelDType::I32,
+            layout: None,
+            shard: None,
+            offset_bytes: Some(0),
+            size_bytes: Some(0),
+            quantization: None,
+            expected_compute_dtype: None,
+            digest: None,
+        };
+        let mut tensors = vec![
+            tensor("model.layers.0.self_attn.q_proj.qweight", vec![896, 16]),
+            tensor("model.layers.0.self_attn.q_proj.qzeros", vec![7, 16]),
+            tensor("model.layers.0.self_attn.q_proj.scales", vec![7, 128]),
+        ];
+        let projections = extract_gptq_projections(&mut tensors).expect("no error, just a skip");
+        assert!(projections.is_empty());
+        assert_eq!(
+            tensors.len(),
+            3,
+            "the AWQ-shaped triple is left completely untouched"
+        );
     }
 
     /// Converts one `bfloat16` value to `f32` exactly: `bfloat16` is

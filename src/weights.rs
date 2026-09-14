@@ -150,15 +150,21 @@ fn parse_shard_file(
 }
 
 /// Either a plain Safetensors payload source, or one wrapping it to
-/// dequantize GPTQ-quantized projections on demand (`gptq.rs`) -- the one
-/// caller (`discover_and_parse_weights`) picks the variant, so every other
-/// caller (`lib.rs::ingest`) just sees one
+/// dequantize GPTQ-quantized (`gptq.rs`), AWQ-quantized (`awq.rs`), or
+/// BitsAndBytes-quantized (`bnb.rs`) projections on demand -- the one
+/// caller (`discover_and_parse_weights`) picks the variant, so every
+/// other caller (`lib.rs::ingest`) just sees one
 /// [`ProductionArtifactPayloadSource`] regardless of which real bundle
-/// shape it read.
+/// shape it read. A bundle declaring more than one quantization method is
+/// not a real shape any actual checkpoint takes (one method per
+/// checkpoint), so this stays a plain enum rather than supporting
+/// simultaneous variants.
 #[derive(Debug)]
 pub enum WeightsPayloadSource {
     Plain(SafetensorsPayloadSource),
     Gptq(crate::gptq::GptqDequantizingPayloadSource<SafetensorsPayloadSource>),
+    Awq(crate::awq::AwqDequantizingPayloadSource<SafetensorsPayloadSource>),
+    Bnb(crate::bnb::BnbDequantizingPayloadSource<SafetensorsPayloadSource>),
 }
 
 impl ProductionArtifactPayloadSource for WeightsPayloadSource {
@@ -169,13 +175,15 @@ impl ProductionArtifactPayloadSource for WeightsPayloadSource {
         match self {
             Self::Plain(source) => source.read_payload(range),
             Self::Gptq(source) => source.read_payload(range),
+            Self::Awq(source) => source.read_payload(range),
+            Self::Bnb(source) => source.read_payload(range),
         }
     }
 }
 
 /// The tensor inventory, shard metadata (empty for the single-file case),
 /// the set of canonical names already in the Runtime's expected
-/// `[in_features, out_features]` orientation (GPTQ-dequantized
+/// `[in_features, out_features]` orientation (GPTQ- or AWQ-dequantized
 /// projections -- `weight_layout.rs`'s transpose must skip these), and a
 /// bounded payload source -- [`discover_and_parse_weights`]'s own return
 /// shape, named so its signature stays readable.
@@ -206,8 +214,19 @@ pub fn discover_and_parse_weights(
     // GPTQ-quantized projections replace their raw `.qweight`/`.qzeros`/
     // `.scales`/`.g_idx` quadruple with one synthesized `<prefix>.weight`
     // placeholder here, *before* the renaming loop below runs (`naming.rs`
-    // does not recognize those raw suffixes and would reject them).
+    // does not recognize those raw suffixes and would reject them). AWQ
+    // detection runs second, over whatever `.qweight` tensors GPTQ left
+    // untouched (no `.g_idx` sibling -- GPTQ's own disambiguating signal).
     let gptq_projections = crate::gptq::extract_gptq_projections(&mut tensors)?;
+    let awq_projections = crate::awq::extract_awq_projections(&mut tensors)?;
+    // BitsAndBytes detection is independent of GPTQ/AWQ (a real
+    // `<prefix>.weight` tensor with a `<prefix>.weight.absmax` sibling --
+    // a naming shape neither other scheme produces) but, uniquely, needs
+    // to *read* a small real JSON blob (`<prefix>.weight.quant_state.
+    // bitsandbytes__nf4`) to learn its real logical shape -- so it must
+    // run here too, while `payload_source` still holds every tensor's
+    // real raw-named location, before the renaming loop below.
+    let bnb_projections = crate::bnb::extract_bnb_projections(&mut tensors, &payload_source)?;
 
     // Real Hugging Face tensor names (e.g. "model.layers.0.self_attn.
     // q_proj.weight") are normalized into the canonical Model Artifact
@@ -227,31 +246,57 @@ pub fn discover_and_parse_weights(
         tensor.name = canonical;
     }
     // `payload_source.locations` at this point holds only whatever the
-    // loop above never `.remove()`'d -- exactly the four raw GPTQ sibling
-    // entries per group (never present in `tensors`, so never targeted by
-    // `.remove()`), still keyed by their real raw names.
-    // `GptqDequantizingPayloadSource` reads them by those raw identities,
-    // so they must survive into the final map alongside the newly
+    // loop above never `.remove()`'d -- exactly the raw GPTQ/AWQ sibling
+    // entries per quantized projection (never present in `tensors`, so
+    // never targeted by `.remove()`) plus, for BnB, every sibling except
+    // the packed weight tensor itself (which *is* still present in
+    // `tensors`, relocated to its canonical key like any other tensor) --
+    // still keyed by their real raw names.
+    // `GptqDequantizingPayloadSource`/`AwqDequantizingPayloadSource`/
+    // `BnbDequantizingPayloadSource` read them by those raw identities, so
+    // they must survive into the final map alongside the newly
     // canonical-keyed ones -- `extend`, not an overwriting assignment,
-    // which would silently drop them and make every GPTQ read fail
+    // which would silently drop them and make every quantized read fail
     // closed with `PayloadOutOfBounds` (a real bug caught by this crate's
     // own end-to-end GPTQ ingestion test, not merely a theoretical risk).
     payload_source.locations.extend(renamed_locations);
 
-    let gptq_canonical_names: std::collections::BTreeSet<String> = gptq_projections
+    // GPTQ/AWQ dequantize directly to the Runtime's expected
+    // `[in_features, out_features]` orientation and so must be *excluded*
+    // from `weight_layout.rs`'s transpose; BnB dequantizes to `nn.
+    // Linear`'s own `[out_features, in_features]` storage convention (see
+    // `bnb.rs`'s own doc comment) and so must still go through it like
+    // any plain weight -- `bnb_projections`' own canonical names are
+    // deliberately not added here.
+    let quantized_canonical_names: std::collections::BTreeSet<String> = gptq_projections
         .iter()
         .map(crate::gptq::GptqProjection::canonical_name)
+        .chain(
+            awq_projections
+                .iter()
+                .map(crate::awq::AwqProjection::canonical_name),
+        )
         .map(str::to_string)
         .collect();
-    let payload_source = if gptq_projections.is_empty() {
-        WeightsPayloadSource::Plain(payload_source)
-    } else {
+    let payload_source = if !gptq_projections.is_empty() {
         WeightsPayloadSource::Gptq(crate::gptq::GptqDequantizingPayloadSource::new(
             payload_source,
             gptq_projections,
         ))
+    } else if !awq_projections.is_empty() {
+        WeightsPayloadSource::Awq(crate::awq::AwqDequantizingPayloadSource::new(
+            payload_source,
+            awq_projections,
+        ))
+    } else if !bnb_projections.is_empty() {
+        WeightsPayloadSource::Bnb(crate::bnb::BnbDequantizingPayloadSource::new(
+            payload_source,
+            bnb_projections,
+        ))
+    } else {
+        WeightsPayloadSource::Plain(payload_source)
     };
-    Ok((tensors, shards, gptq_canonical_names, payload_source))
+    Ok((tensors, shards, quantized_canonical_names, payload_source))
 }
 
 fn discover_single_file(

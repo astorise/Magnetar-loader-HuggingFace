@@ -18,6 +18,8 @@
 //! `ModelTrustStore::evaluate` like any other manifest before Model
 //! Loading may materialize anything from it.
 
+mod awq;
+mod bnb;
 mod chat_template;
 mod config;
 mod derived_lm_head;
@@ -107,7 +109,7 @@ impl ProductionModelArtifactIngestor for HuggingFaceIngestor {
         })?;
         let mut normalized_config = config::parse(&config_bytes)?;
 
-        let (mut tensors, shards, gptq_projection_names, payload_source) =
+        let (mut tensors, shards, quantized_projection_names, payload_source) =
             weights::discover_and_parse_weights(source)?;
         if tensors.is_empty() {
             return Err(ProductionIngestionError::MalformedMetadata {
@@ -133,15 +135,15 @@ impl ProductionModelArtifactIngestor for HuggingFaceIngestor {
         // expects [in_features, out_features] instead -- see
         // `weight_layout.rs`. `token_embedding` (a lookup table) and the
         // 1D normalization vectors are excluded structurally, never
-        // transposed -- as are any GPTQ-dequantized projections
-        // (`gptq_projection_names`), already `[in_features, out_features]`
-        // by construction (`gptq.rs`).
+        // transposed -- as are any GPTQ- or AWQ-dequantized projections
+        // (`quantized_projection_names`), already `[in_features,
+        // out_features]` by construction (`gptq.rs`/`awq.rs`).
         let transposing_source = weight_layout::TransposingPayloadSource::new(
             payload_source,
             &tensors,
-            &gptq_projection_names,
+            &quantized_projection_names,
         );
-        weight_layout::swap_declared_projection_shapes(&mut tensors, &gptq_projection_names);
+        weight_layout::swap_declared_projection_shapes(&mut tensors, &quantized_projection_names);
 
         // A real `tie_word_embeddings: true` checkpoint genuinely omits
         // `lm_head.weight` -- the model reuses `token_embedding` for the
@@ -807,6 +809,359 @@ mod tests {
                     "value[{i}][{o}]: got {actual}, expected {expected}"
                 );
             }
+        }
+    }
+
+    /// End-to-end proof that an AWQ-quantized bundle ingests correctly
+    /// through the full `ingest()` pipeline, not just the low-level
+    /// dequantization math (`awq.rs`'s own tests, including the real
+    /// public-checkpoint comparison). Also proves `extract_gptq_
+    /// projections`'s own skip-when-no-`g_idx` behavior end to end: this
+    /// bundle's `.qweight` tensor has no `.g_idx` sibling, so GPTQ
+    /// extraction must leave it alone and AWQ extraction must claim it.
+    #[test]
+    fn ingests_an_awq_quantized_bundle_end_to_end() {
+        const AWQ_REVERSE_ORDER: [i32; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
+        fn pack_i32_awq_order(semantic_codes: &[i32; 8]) -> i32 {
+            let mut value: i32 = 0;
+            for (semantic_col, nibble) in semantic_codes.iter().enumerate() {
+                let position = AWQ_REVERSE_ORDER[semantic_col];
+                value |= (nibble & 0xF) << (4 * position);
+            }
+            value
+        }
+        fn f16_bits_from_f32(value: f32) -> u16 {
+            let bits = value.to_bits();
+            let sign = (bits >> 16) & 0x8000;
+            let exponent = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
+            let mantissa = (bits >> 13) & 0x3FF;
+            (sign | ((exponent as u32) << 10) | mantissa) as u16
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: serde_json::Value = serde_json::from_slice(&qwen2_config_bytes()).unwrap();
+        config["hidden_size"] = serde_json::json!(8);
+        config["intermediate_size"] = serde_json::json!(8);
+        config["num_attention_heads"] = serde_json::json!(1);
+        config["num_key_value_heads"] = serde_json::json!(1);
+        config["vocab_size"] = serde_json::json!(4);
+        config["tie_word_embeddings"] = serde_json::json!(false);
+        fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+
+        // One AWQ group covering all 8 input channels, out_features=8
+        // (one packed column-block): semantic codes [0,1,...,7], zero=3,
+        // scale=0.1 -- identical for every one of the 8 input-channel
+        // rows, matching `awq.rs`'s own hand-built unit test's shape.
+        let packed_col_block = pack_i32_awq_order(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        let qweight_bytes: Vec<u8> = std::iter::repeat_n(packed_col_block, 8)
+            .flat_map(i32::to_le_bytes)
+            .collect();
+        let qzeros_bytes: Vec<u8> = pack_i32_awq_order(&[3; 8]).to_le_bytes().to_vec();
+        let scales_bytes: Vec<u8> = std::iter::repeat_n(f16_bits_from_f32(0.1), 8)
+            .flat_map(u16::to_le_bytes)
+            .collect();
+
+        let mut header = serde_json::Map::new();
+        let mut data = Vec::new();
+        let mut push = |header: &mut serde_json::Map<String, serde_json::Value>,
+                        name: &str,
+                        dtype: &str,
+                        shape: Vec<u64>,
+                        bytes: &[u8]| {
+            let start = data.len() as u64;
+            data.extend_from_slice(bytes);
+            let end = data.len() as u64;
+            header.insert(
+                name.to_string(),
+                serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [start, end]}),
+            );
+        };
+        push(
+            &mut header,
+            "model.embed_tokens.weight",
+            "F32",
+            vec![4, 8],
+            &[0u8; 4 * 8 * 4],
+        );
+        push(
+            &mut header,
+            "model.norm.weight",
+            "F32",
+            vec![8],
+            &1.0f32.to_le_bytes().repeat(8),
+        );
+        push(
+            &mut header,
+            "model.layers.0.self_attn.q_proj.qweight",
+            "I32",
+            vec![8, 1],
+            &qweight_bytes,
+        );
+        push(
+            &mut header,
+            "model.layers.0.self_attn.q_proj.qzeros",
+            "I32",
+            vec![1, 1],
+            &qzeros_bytes,
+        );
+        push(
+            &mut header,
+            "model.layers.0.self_attn.q_proj.scales",
+            "F16",
+            vec![1, 8],
+            &scales_bytes,
+        );
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut file = fs::File::create(dir.path().join("model.safetensors")).unwrap();
+        file.write_all(&(header_bytes.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header_bytes).unwrap();
+        file.write_all(&data).unwrap();
+
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        let result = HuggingFaceIngestor::new()
+            .ingest(&source)
+            .expect("an AWQ-quantized bundle ingests");
+
+        let q_proj = result
+            .manifest
+            .tensors
+            .iter()
+            .find(|tensor| tensor.name == "layers.0.self_attn.q_proj")
+            .expect("the AWQ projection is present under its canonical name");
+        assert_eq!(
+            q_proj.shape,
+            vec![8, 8],
+            "AWQ's own packing already puts [in_features, out_features] first -- \
+             the transpose exclusion must have kept this from being swapped a second time"
+        );
+        assert_eq!(q_proj.storage_dtype, ModelDType::F32);
+        assert!(
+            !result
+                .manifest
+                .tensors
+                .iter()
+                .any(|tensor| tensor.name.contains("qweight") || tensor.name.contains("qzeros")),
+            "the three raw AWQ siblings must not leak into the final manifest"
+        );
+
+        let range = magnetar_runtime::production_model_ingestion::ProductionPayloadRange {
+            identity: q_proj.name.clone(),
+            offset: q_proj.offset_bytes.unwrap(),
+            length: q_proj.size_bytes.unwrap(),
+            digest: None,
+        };
+        let bytes = result.payload_source.read_payload(&range).unwrap();
+        let values: Vec<f32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect();
+        assert_eq!(values.len(), 64);
+        // Row-major [in_features=8, out_features=8]: every input channel
+        // shares the same packed column-block, so the value depends only
+        // on the output column: (semantic code - 3) * 0.1.
+        for i in 0..8usize {
+            for o in 0..8usize {
+                let expected = 0.1 * (o as f32 - 3.0);
+                let actual = values[i * 8 + o];
+                assert!(
+                    (actual - expected).abs() < 1e-3,
+                    "value[{i}][{o}]: got {actual}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    /// End-to-end proof that a BitsAndBytes-quantized bundle ingests
+    /// correctly through the full `ingest()` pipeline, not just the
+    /// low-level dequantization math (`bnb.rs`'s own tests, including the
+    /// real public-checkpoint comparison). This is the one quantization
+    /// scheme whose packed weight tensor keeps the literal raw name
+    /// `<prefix>.weight` -- the exact identity-relocation subtlety this
+    /// test exercises (`extract_bnb_projections`'s own `weight_range.
+    /// identity = canonical_name` fix) never comes up for GPTQ/AWQ, whose
+    /// synthesized placeholders are pushed under a name distinct from any
+    /// raw tensor. Also proves BnB projections are *not* excluded from
+    /// this crate's `nn.Linear`-storage-convention transpose, unlike
+    /// GPTQ/AWQ (uses a square 8x8 shape so a transpose bug would not be
+    /// masked by symmetry in the byte layout itself, even though this
+    /// particular fixture's dequantized values happen to be uniform).
+    #[test]
+    fn ingests_a_bnb_quantized_bundle_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: serde_json::Value = serde_json::from_slice(&qwen2_config_bytes()).unwrap();
+        config["hidden_size"] = serde_json::json!(8);
+        config["intermediate_size"] = serde_json::json!(8);
+        config["num_attention_heads"] = serde_json::json!(1);
+        config["num_key_value_heads"] = serde_json::json!(1);
+        config["vocab_size"] = serde_json::json!(4);
+        config["tie_word_embeddings"] = serde_json::json!(false);
+        fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+
+        // 64 elements (out_features=8, in_features=8), one first-level
+        // block (blocksize=64) and one nested block (nested_blocksize=1):
+        // every element dequantizes to the same value, matching `bnb.rs`'s
+        // own hand-built double-quantized unit test's arithmetic
+        // (quant_map[7] * (nested_quant_map[42]*nested_absmax[0] + 0.5) =
+        // 7.0 * (3.0*2.0 + 0.5) = 45.5), exercised here through the real
+        // file-based ingestion path instead.
+        let quant_map_bytes: Vec<u8> = (0..16u32).flat_map(|v| (v as f32).to_le_bytes()).collect();
+        let weight_bytes = vec![0x77u8; 32]; // 64 elements, 2 per byte, both nibbles = 7
+        let absmax_bytes = vec![42u8];
+        let mut nested_quant_map = vec![0.0f32; 256];
+        nested_quant_map[42] = 3.0;
+        let nested_quant_map_bytes: Vec<u8> = nested_quant_map
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let nested_absmax_bytes: Vec<u8> = 2.0f32.to_le_bytes().to_vec();
+        let quant_state_json = serde_json::json!({
+            "quant_type": "nf4",
+            "blocksize": 64,
+            "dtype": "bfloat16",
+            "shape": [8, 8],
+            "nested_blocksize": 1,
+            "nested_dtype": "float32",
+            "nested_offset": 0.5
+        })
+        .to_string()
+        .into_bytes();
+
+        let mut header = serde_json::Map::new();
+        let mut data = Vec::new();
+        let mut push = |header: &mut serde_json::Map<String, serde_json::Value>,
+                        name: &str,
+                        dtype: &str,
+                        shape: Vec<u64>,
+                        bytes: &[u8]| {
+            let start = data.len() as u64;
+            data.extend_from_slice(bytes);
+            let end = data.len() as u64;
+            header.insert(
+                name.to_string(),
+                serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [start, end]}),
+            );
+        };
+        push(
+            &mut header,
+            "model.embed_tokens.weight",
+            "F32",
+            vec![4, 8],
+            &[0u8; 4 * 8 * 4],
+        );
+        push(
+            &mut header,
+            "model.norm.weight",
+            "F32",
+            vec![8],
+            &1.0f32.to_le_bytes().repeat(8),
+        );
+        push(
+            &mut header,
+            "model.layers.0.self_attn.q_proj.weight",
+            "U8",
+            vec![32, 1],
+            &weight_bytes,
+        );
+        push(
+            &mut header,
+            "model.layers.0.self_attn.q_proj.weight.absmax",
+            "U8",
+            vec![1],
+            &absmax_bytes,
+        );
+        push(
+            &mut header,
+            "model.layers.0.self_attn.q_proj.weight.quant_map",
+            "F32",
+            vec![16],
+            &quant_map_bytes,
+        );
+        push(
+            &mut header,
+            "model.layers.0.self_attn.q_proj.weight.nested_absmax",
+            "F32",
+            vec![1],
+            &nested_absmax_bytes,
+        );
+        push(
+            &mut header,
+            "model.layers.0.self_attn.q_proj.weight.nested_quant_map",
+            "F32",
+            vec![256],
+            &nested_quant_map_bytes,
+        );
+        push(
+            &mut header,
+            "model.layers.0.self_attn.q_proj.weight.quant_state.bitsandbytes__nf4",
+            "U8",
+            vec![quant_state_json.len() as u64],
+            &quant_state_json,
+        );
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut file = fs::File::create(dir.path().join("model.safetensors")).unwrap();
+        file.write_all(&(header_bytes.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header_bytes).unwrap();
+        file.write_all(&data).unwrap();
+
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        let result = HuggingFaceIngestor::new()
+            .ingest(&source)
+            .expect("a BitsAndBytes-quantized bundle ingests");
+
+        let q_proj = result
+            .manifest
+            .tensors
+            .iter()
+            .find(|tensor| tensor.name == "layers.0.self_attn.q_proj")
+            .expect("the BnB projection is present under its canonical name");
+        assert_eq!(q_proj.shape, vec![8, 8]);
+        assert_eq!(q_proj.storage_dtype, ModelDType::F32);
+        assert!(
+            !result
+                .manifest
+                .tensors
+                .iter()
+                .any(|tensor| tensor.name.contains("absmax") || tensor.name.contains("quant_map")),
+            "the BnB sibling tensors must not leak into the final manifest"
+        );
+
+        let range = magnetar_runtime::production_model_ingestion::ProductionPayloadRange {
+            identity: q_proj.name.clone(),
+            offset: q_proj.offset_bytes.unwrap(),
+            length: q_proj.size_bytes.unwrap(),
+            digest: None,
+        };
+        let bytes = result.payload_source.read_payload(&range).unwrap();
+        let values: Vec<f32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect();
+        assert_eq!(values.len(), 64);
+        for (index, value) in values.iter().enumerate() {
+            assert!(
+                (value - 45.5).abs() < 1e-3,
+                "value[{index}]: got {value}, expected 45.5"
+            );
         }
     }
 }
