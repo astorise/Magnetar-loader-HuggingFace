@@ -41,8 +41,8 @@ pub use weight_layout::{TransposingPayloadSource, swap_declared_projection_shape
 pub use weights::SafetensorsPayloadSource;
 
 use magnetar_runtime::model::{
-    ModelArchitecture, ModelArtifactId, ModelArtifactKind, ModelArtifactPart, ModelDType,
-    ModelDigest, ModelManifest, ModelName, ModelRevision,
+    ModelArtifactId, ModelArtifactKind, ModelArtifactPart, ModelDType, ModelDigest, ModelManifest,
+    ModelName, ModelRevision,
 };
 use magnetar_runtime::production_model_ingestion::{
     ProductionArtifactPayloadSource, ProductionIngestionError, ProductionIngestionResult,
@@ -68,6 +68,28 @@ impl HuggingFaceIngestor {
     pub fn new() -> Self {
         Self
     }
+}
+
+/// The Model Artifact's architecture family (Tachyon integration audit
+/// MAG-01, astorise/Magnetar#83): previously hardcoded to `"qwen"`
+/// regardless of the real ingested `config.json`, which made every
+/// downstream family-compatibility check (`FirstNativeModelConfig::
+/// validate`) tautological -- it always compared a value this crate
+/// invented against itself.
+///
+/// Currently a direct, unopinionated pass-through of the real `model_type`
+/// HF declares (`"qwen2"`, `"llama"`, `"mistral"`, ...) -- deliberately
+/// *not* grouping related model_types into a shared family. Whether, say,
+/// `"qwen2"` and `"qwen2_moe"` should be treated as interchangeable is a
+/// real Magnetar product decision (it depends on real capability
+/// differences a loader has no basis to judge), not something this crate
+/// should decide unilaterally. Until that decision is made, family ==
+/// model_type exactly: every distinct source architecture gets its own
+/// distinct, honest family value instead of a shared lie, which is already
+/// enough for a real family-mismatch check (e.g. a Llama Artifact against
+/// a Component that only declares Qwen support) to work.
+fn architecture_family(model_type: &str) -> String {
+    model_type.to_string()
 }
 
 fn sanitize_model_name(model_type: &str) -> String {
@@ -309,37 +331,37 @@ impl ProductionModelArtifactIngestor for HuggingFaceIngestor {
             ModelDigest::sha256(&config_bytes),
         );
 
-        let manifest = ModelManifest {
-            schema_version: magnetar_runtime::model::MODEL_ARTIFACT_SCHEMA_VERSION,
-            id,
-            architecture: ModelArchitecture::new(
-                "qwen",
-                normalized_config.metadata.model_type.clone(),
-            ),
-            parts,
-            storage_dtype,
-            compute_dtype: None,
-            supported_compute_dtypes,
-            tensors,
-            tokenizer: tokenizer_reference,
-            tokenizer_config: tokenizer_config_metadata
-                .as_ref()
-                .and(Some("tokenizer".to_string())),
-            chat_template: chat_template_reference,
-            prompt_template: None,
-            generation,
-            quantization: None,
-            shards,
-            runtime_features: BTreeSet::new(),
-            memory_features: BTreeSet::new(),
-            provider_capabilities: Vec::new(),
-            component: None,
-            license: None,
-            provenance: None,
-            signatures: Vec::new(),
-            source: Some(source.kind().clone()),
-            architecture_config: Some(normalized_config.architecture_config),
-        };
+        let manifest =
+            ModelManifest {
+                schema_version: magnetar_runtime::model::MODEL_ARTIFACT_SCHEMA_VERSION,
+                id,
+                architecture: normalized_config.metadata.normalize_architecture(
+                    architecture_family(&normalized_config.metadata.model_type),
+                ),
+                parts,
+                storage_dtype,
+                compute_dtype: None,
+                supported_compute_dtypes,
+                tensors,
+                tokenizer: tokenizer_reference,
+                tokenizer_config: tokenizer_config_metadata
+                    .as_ref()
+                    .and(Some("tokenizer".to_string())),
+                chat_template: chat_template_reference,
+                prompt_template: None,
+                generation,
+                quantization: None,
+                shards,
+                runtime_features: BTreeSet::new(),
+                memory_features: BTreeSet::new(),
+                provider_capabilities: Vec::new(),
+                component: None,
+                license: None,
+                provenance: None,
+                signatures: Vec::new(),
+                source: Some(source.kind().clone()),
+                architecture_config: Some(normalized_config.architecture_config),
+            };
 
         Ok(ProductionIngestionResult {
             manifest,
@@ -359,6 +381,30 @@ mod tests {
         serde_json::json!({
             "architectures": ["Qwen2ForCausalLM"],
             "model_type": "qwen2",
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "vocab_size": 32,
+            "rms_norm_eps": 1e-06,
+            "rope_theta": 10000.0,
+            "tie_word_embeddings": true,
+            "torch_dtype": "float32",
+            "bos_token_id": 0,
+            "eos_token_id": 1
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// [`qwen2_config_bytes`], parameterized over `architectures`/
+    /// `model_type` (#83) -- everything else stays identical so only the
+    /// architecture identity varies between cases.
+    fn config_bytes_with_model_type(architectures: &str, model_type: &str) -> Vec<u8> {
+        serde_json::json!({
+            "architectures": [architectures],
+            "model_type": model_type,
             "hidden_size": 8,
             "intermediate_size": 16,
             "num_hidden_layers": 1,
@@ -418,6 +464,11 @@ mod tests {
         let config = result.manifest.architecture_config.clone().unwrap();
         assert_eq!(config.hidden_size, 8);
         assert_eq!(config.num_hidden_layers, 1);
+        // #83: family must be the real ingested model_type, never a
+        // hardcoded "qwen" -- this bundle's own config.json declares
+        // "qwen2", so that's what both family and identifier must read.
+        assert_eq!(result.manifest.architecture.family, "qwen2");
+        assert_eq!(result.manifest.architecture.identifier, "qwen2");
         assert!(
             result.manifest.chat_template.is_none(),
             "this bundle declares no tokenizer_config.json, so no chat template reference"
@@ -433,6 +484,49 @@ mod tests {
         // The manifest is independently well-formed per the existing
         // Model Artifact contract.
         result.manifest.validate().expect("manifest validates");
+    }
+
+    /// #83: the ingested architecture family must reflect the real
+    /// `config.json` `model_type`, never a hardcoded `"qwen"` -- verified
+    /// across several distinct real HF `model_type` values, plus one this
+    /// crate has never seen before (`"some_future_arch"`), to prove this
+    /// isn't an allowlist that would reject an unrecognized-but-valid
+    /// architecture.
+    #[test]
+    fn architecture_family_reflects_the_real_ingested_model_type() {
+        let cases = [
+            ("Qwen2ForCausalLM", "qwen2"),
+            ("LlamaForCausalLM", "llama"),
+            ("MistralForCausalLM", "mistral"),
+            ("SomeFutureArchForCausalLM", "some_future_arch"),
+        ];
+        for (architectures, model_type) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(
+                dir.path().join("config.json"),
+                config_bytes_with_model_type(architectures, model_type),
+            )
+            .unwrap();
+            write_tiny_safetensors(&dir.path().join("model.safetensors"));
+
+            let source = ProductionModelSource::authorized_local_bundle(
+                ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+                dir.path().to_path_buf(),
+            );
+            let result = HuggingFaceIngestor::new()
+                .ingest(&source)
+                .unwrap_or_else(|error| panic!("{model_type} bundle must ingest: {error}"));
+
+            assert_eq!(
+                result.manifest.architecture.family, model_type,
+                "family must be the real model_type, not a hardcoded value"
+            );
+            assert_eq!(result.manifest.architecture.identifier, model_type);
+            assert_ne!(
+                result.manifest.architecture.family, "qwen",
+                "{model_type} must never be silently relabeled \"qwen\""
+            );
+        }
     }
 
     /// A real chat template, when declared, is threaded into the manifest
