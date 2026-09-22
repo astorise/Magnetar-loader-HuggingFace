@@ -32,7 +32,7 @@ sha2 = "0.10"
 # Contract (task group 9). Kept out of `magnetar-runtime` entirely --
 # this external crate is the only place in the workspace that depends on
 # it.
-tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 # Real chat-template rendering (`close-tachyon-scope-audit-gaps` task
 # group 2): real Hugging Face `tokenizer_config.json` chat templates are
 # Jinja2 templates; `minijinja` is a small, actively maintained Jinja2-
