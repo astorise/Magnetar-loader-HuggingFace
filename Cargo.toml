@@ -27,7 +27,7 @@ magnetar-runtime = { path = "../../magnetar-runtime" }
 magnetar-format-safetensors = { path = "../../formats/safetensors" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 # The real `tokenizer.json`-backed implementation behind Tokenizer
 # Contract (task group 9). Kept out of `magnetar-runtime` entirely --
 # this external crate is the only place in the workspace that depends on
