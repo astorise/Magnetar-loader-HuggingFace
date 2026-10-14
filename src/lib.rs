@@ -349,6 +349,7 @@ impl ProductionModelArtifactIngestor for HuggingFaceIngestor {
                     .and(Some("tokenizer".to_string())),
                 chat_template: chat_template_reference,
                 prompt_template: None,
+                artifact_format: magnetar_runtime::model::ArtifactFormat::HuggingFace,
                 generation,
                 quantization: None,
                 shards,
