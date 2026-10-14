@@ -1,0 +1,134 @@
+name: Release Publication
+
+# Publishes `magnetar-loader-huggingface` to crates.io.
+#
+# `dry-run-publish` needs no credential and runs on every trigger.
+# `real-publish` only runs on a manual `workflow_dispatch` (never off a tag
+# push) and fails closed with an explicit message when `CARGO_REGISTRY_TOKEN`
+# is not configured, matching the parent repository's
+# `release-publication.yml` (MAG-06).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-publication-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  dry-run-publish:
+    name: release-publication / dry-run publish
+    runs-on: ubuntu-latest
+    steps:
+      # The crate depends on `magnetar-runtime` through a relative path
+      # (`../../magnetar-runtime`), so it is only buildable inside a checkout of
+      # the parent repository with this repository placed at `loaders/huggingface`.
+      - name: Checkout parent Magnetar repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: astorise/Magnetar
+          path: Magnetar
+      - name: Checkout this crate at loaders/huggingface
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: Magnetar/loaders/huggingface
+      - name: Checkout sibling crate at formats/safetensors
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: astorise/Magnetar-format-safetensors
+          path: Magnetar/formats/safetensors
+      - name: Install pinned Rust toolchain
+        working-directory: Magnetar/loaders/huggingface
+        run: rustup show
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: Magnetar/loaders/huggingface
+      - name: Check tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: Magnetar/loaders/huggingface
+        run: |
+          version="$(cargo metadata --locked --no-deps --format-version=1 | jq -r '.packages[0].version')"
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match magnetar-loader-huggingface version $version" >&2
+            exit 1
+          fi
+      # A full `cargo publish --dry-run` resolves every dependency from
+      # crates.io, which fails until the upstream Magnetar crates are
+      # published. `cargo package --list` still validates the manifest
+      # (metadata, `version` + `path` dependencies) and the packaged file set;
+      # the build verification happens in `real-publish`'s `cargo publish`.
+      - name: cargo package --list (no credential required)
+        working-directory: Magnetar/loaders/huggingface
+        run: cargo package --locked --list
+
+  real-publish:
+    name: release-publication / cargo publish (real)
+    runs-on: ubuntu-latest
+    needs: [dry-run-publish]
+    if: github.event_name == 'workflow_dispatch'
+    environment: release
+    steps:
+      # The crate depends on `magnetar-runtime` through a relative path
+      # (`../../magnetar-runtime`), so it is only buildable inside a checkout of
+      # the parent repository with this repository placed at `loaders/huggingface`.
+      - name: Checkout parent Magnetar repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: astorise/Magnetar
+          path: Magnetar
+      - name: Checkout this crate at loaders/huggingface
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: Magnetar/loaders/huggingface
+      - name: Checkout sibling crate at formats/safetensors
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: astorise/Magnetar-format-safetensors
+          path: Magnetar/formats/safetensors
+      - name: Install pinned Rust toolchain
+        working-directory: Magnetar/loaders/huggingface
+        run: rustup show
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: Magnetar/loaders/huggingface
+      - name: Check tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: Magnetar/loaders/huggingface
+        run: |
+          version="$(cargo metadata --locked --no-deps --format-version=1 | jq -r '.packages[0].version')"
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match magnetar-loader-huggingface version $version" >&2
+            exit 1
+          fi
+      # `cargo publish` resolves the dependencies below from crates.io.
+      # Publish them first (magnetar-runtime, then formats, then this crate).
+      - name: Check upstream crates are published
+        run: |
+          for crate in magnetar-runtime magnetar-format-safetensors; do
+            if ! curl -fsS -A "Magnetar-loader-HuggingFace-release" "https://crates.io/api/v1/crates/$crate" > /dev/null; then
+              echo "::error::$crate is not published on crates.io yet; publish it before magnetar-loader-huggingface" >&2
+              exit 1
+            fi
+          done
+      - name: Check crates.io token is configured
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not configured as a repository secret (Settings > Secrets and variables > Actions)." >&2
+            exit 1
+          fi
+      - name: cargo publish (real)
+        working-directory: Magnetar/loaders/huggingface
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
