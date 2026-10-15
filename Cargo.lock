@@ -880,7 +880,7 @@ checksum = "fc04a4c58212d57930a24bf47d3fa87485264a3a054e9c10e042eb373573ad3c"
 
 [[package]]
 name = "magnetar-format-safetensors"
-version = "0.1.0"
+version = "1.0.0-RC0"
 dependencies = [
  "magnetar-runtime",
  "serde_json",
@@ -888,7 +888,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-loader-huggingface"
-version = "0.1.0"
+version = "1.0.0-RC0"
 dependencies = [
  "magnetar-format-safetensors",
  "magnetar-runtime",
@@ -902,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-runtime"
-version = "0.1.0"
+version = "1.0.0-RC0"
 dependencies = [
  "ed25519-dalek",
  "flate2",

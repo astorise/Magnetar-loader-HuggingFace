@@ -2,7 +2,7 @@
 
 [package]
 name = "magnetar-loader-huggingface"
-version = "0.1.0"
+version = "1.0.0-RC0"
 edition = "2024"
 license = "MIT"
 description = "Hugging Face (safetensors) production model loader for the Magnetar inference runtime."
@@ -15,8 +15,8 @@ rust-version = "1.98"
 [dependencies]
 # `path` resolves inside a checkout of the parent Magnetar repository;
 # `version` is what `cargo publish` records for crates.io consumers.
-magnetar-runtime = { version = "0.1.0", path = "../../magnetar-runtime" }
-magnetar-format-safetensors = { version = "0.1.0", path = "../../formats/safetensors" }
+magnetar-runtime = { version = "1.0.0-RC0", path = "../../magnetar-runtime" }
+magnetar-format-safetensors = { version = "1.0.0-RC0", path = "../../formats/safetensors" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
