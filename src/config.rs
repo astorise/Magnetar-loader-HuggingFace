@@ -3,8 +3,9 @@
 //! [`HfConfigMetadata`] contracts (`implement-production-qwen-model-loading`
 //! task group 3, Decision 5).
 
-use magnetar_runtime::model::ModelArchitectureConfig;
+use magnetar_runtime::model::{ModelArchitectureConfig, RopeFrequencyScaling};
 use magnetar_runtime::model_format_roadmap::{HfConfigMetadata, HfRopeMetadata};
+use magnetar_runtime::operator::RopeBandedFrequencyScaling;
 use magnetar_runtime::production_model_ingestion::ProductionIngestionError;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -54,8 +55,67 @@ struct RawHfConfig {
 struct RawRopeScaling {
     #[serde(default, rename = "type")]
     scaling_type: Option<String>,
+    /// The newer spelling of `type` (`transformers` >= 4.43).
+    #[serde(default)]
+    rope_type: Option<String>,
     #[serde(default)]
     factor: Option<f64>,
+    #[serde(default)]
+    low_freq_factor: Option<f64>,
+    #[serde(default)]
+    high_freq_factor: Option<f64>,
+    #[serde(default)]
+    original_max_position_embeddings: Option<u64>,
+}
+
+impl RawRopeScaling {
+    fn kind(&self) -> Option<&str> {
+        self.rope_type.as_deref().or(self.scaling_type.as_deref())
+    }
+}
+
+/// The normalized RoPE scaling a `rope_scaling` object declares: a linear
+/// position factor (`linear`, or a bare `factor` with no type -- this
+/// loader's behaviour before types were read), a per-frequency scheme
+/// (`llama3`), or nothing (`default`). Any other scheme (`yarn`, `dynamic`,
+/// `longrope`, ...) is refused: ingesting it as unscaled or as a plain
+/// factor would load a checkpoint whose every token is then wrong.
+fn rope_scaling(
+    raw: Option<&RawRopeScaling>,
+) -> Result<(Option<f32>, Option<RopeFrequencyScaling>), ProductionIngestionError> {
+    let Some(raw) = raw else {
+        return Ok((None, None));
+    };
+    match raw.kind() {
+        None | Some("linear") => Ok((raw.factor.map(|value| value as f32), None)),
+        Some("default") => Ok((None, None)),
+        Some("llama3") => {
+            let field = |value: Option<f64>, name: &str| {
+                value.ok_or_else(|| ProductionIngestionError::MalformedMetadata {
+                    reason: format!("config.json's llama3 rope_scaling has no '{name}'"),
+                })
+            };
+            let scaling = RopeBandedFrequencyScaling {
+                factor: field(raw.factor, "factor")?,
+                low_freq_factor: field(raw.low_freq_factor, "low_freq_factor")?,
+                high_freq_factor: field(raw.high_freq_factor, "high_freq_factor")?,
+                original_context_length: raw.original_max_position_embeddings.ok_or_else(|| {
+                    ProductionIngestionError::MalformedMetadata {
+                        reason: "config.json's llama3 rope_scaling has no \
+                                 'original_max_position_embeddings'"
+                            .into(),
+                    }
+                })?,
+            };
+            scaling
+                .validate()
+                .map_err(|reason| ProductionIngestionError::MalformedMetadata { reason })?;
+            Ok((None, Some(RopeFrequencyScaling::Banded(scaling))))
+        }
+        Some(other) => Err(ProductionIngestionError::UnsupportedFormat {
+            reason: format!("config.json's rope_scaling type '{other}' is not supported"),
+        }),
+    }
 }
 
 /// `eos_token_id` is a single integer for most Hugging Face configs but a
@@ -165,6 +225,7 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
         });
     }
 
+    let (rope_scaling_factor, rope_frequency_scaling) = rope_scaling(raw.rope_scaling.as_ref())?;
     let architecture_config = ModelArchitectureConfig {
         hidden_size,
         intermediate_size,
@@ -175,11 +236,8 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
         vocab_size,
         rms_norm_eps,
         rope_theta,
-        rope_scaling_factor: raw
-            .rope_scaling
-            .as_ref()
-            .and_then(|scaling| scaling.factor)
-            .map(|value| value as f32),
+        rope_scaling_factor,
+        rope_frequency_scaling,
         tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(false),
         // `config.json` never declares this for real Qwen2/2.5 checkpoints
         // (it's an architectural default of the model class, not a
@@ -222,7 +280,7 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
             scaling_type: raw
                 .rope_scaling
                 .as_ref()
-                .and_then(|scaling| scaling.scaling_type.clone()),
+                .and_then(|scaling| scaling.kind().map(str::to_string)),
             scaling_factor: raw
                 .rope_scaling
                 .as_ref()
@@ -280,6 +338,89 @@ mod tests {
         assert_eq!(config.eos_token_id, Some(151645));
         assert_eq!(normalized.metadata.model_type, "qwen2");
         assert_eq!(normalized.metadata.torch_dtype.as_deref(), Some("bfloat16"));
+    }
+
+    /// Llama 3.2 1B Instruct's real `config.json` (rope and shape fields).
+    fn llama3_2_1b_config() -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": 2048,
+            "intermediate_size": 8192,
+            "num_hidden_layers": 16,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "head_dim": 64,
+            "vocab_size": 128256,
+            "rms_norm_eps": 1e-05,
+            "rope_theta": 500000.0,
+            "rope_scaling": {
+                "factor": 32.0,
+                "high_freq_factor": 4.0,
+                "low_freq_factor": 1.0,
+                "original_max_position_embeddings": 8192,
+                "rope_type": "llama3"
+            },
+            "tie_word_embeddings": true,
+            "torch_dtype": "bfloat16",
+            "bos_token_id": 128000,
+            "eos_token_id": [128001, 128008, 128009],
+            "max_position_embeddings": 131072
+        })
+    }
+
+    #[test]
+    fn parses_llama3_rope_scaling_as_a_frequency_scheme_not_a_position_factor() {
+        let bytes = serde_json::to_vec(&llama3_2_1b_config()).unwrap();
+        let normalized = parse(&bytes).expect("Llama 3.2 config parses");
+        let config = normalized.architecture_config;
+        assert_eq!(config.rope_scaling_factor, None);
+        assert_eq!(
+            config.rope_frequency_scaling,
+            Some(RopeFrequencyScaling::Banded(RopeBandedFrequencyScaling {
+                factor: 32.0,
+                low_freq_factor: 1.0,
+                high_freq_factor: 4.0,
+                original_context_length: 8192,
+            }))
+        );
+        assert_eq!(normalized.metadata.model_type, "llama");
+        assert_eq!(
+            normalized
+                .metadata
+                .rope
+                .and_then(|rope| rope.scaling_type)
+                .as_deref(),
+            Some("llama3")
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_or_unknown_rope_scaling() {
+        let mut incomplete = llama3_2_1b_config();
+        incomplete["rope_scaling"]
+            .as_object_mut()
+            .unwrap()
+            .remove("low_freq_factor");
+        assert!(matches!(
+            parse(&serde_json::to_vec(&incomplete).unwrap()).unwrap_err(),
+            ProductionIngestionError::MalformedMetadata { .. }
+        ));
+        let mut yarn = llama3_2_1b_config();
+        yarn["rope_scaling"] = serde_json::json!({"rope_type": "yarn", "factor": 4.0});
+        assert!(matches!(
+            parse(&serde_json::to_vec(&yarn).unwrap()).unwrap_err(),
+            ProductionIngestionError::UnsupportedFormat { .. }
+        ));
+        let mut default = llama3_2_1b_config();
+        default["rope_scaling"] = serde_json::json!({"rope_type": "default"});
+        let config = parse(&serde_json::to_vec(&default).unwrap())
+            .unwrap()
+            .architecture_config;
+        assert_eq!(
+            (config.rope_scaling_factor, config.rope_frequency_scaling),
+            (None, None)
+        );
     }
 
     #[test]
