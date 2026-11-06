@@ -5,7 +5,7 @@
 
 use magnetar_runtime::model::{ModelArchitectureConfig, RopeFrequencyScaling};
 use magnetar_runtime::model_format_roadmap::{HfConfigMetadata, HfRopeMetadata};
-use magnetar_runtime::operator::RopeLlama3Scaling;
+use magnetar_runtime::operator::RopeBandedFrequencyScaling;
 use magnetar_runtime::production_model_ingestion::ProductionIngestionError;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -95,7 +95,7 @@ fn rope_scaling(
                     reason: format!("config.json's llama3 rope_scaling has no '{name}'"),
                 })
             };
-            let scaling = RopeLlama3Scaling {
+            let scaling = RopeBandedFrequencyScaling {
                 factor: field(raw.factor, "factor")?,
                 low_freq_factor: field(raw.low_freq_factor, "low_freq_factor")?,
                 high_freq_factor: field(raw.high_freq_factor, "high_freq_factor")?,
@@ -110,7 +110,7 @@ fn rope_scaling(
             scaling
                 .validate()
                 .map_err(|reason| ProductionIngestionError::MalformedMetadata { reason })?;
-            Ok((None, Some(RopeFrequencyScaling::Llama3(scaling))))
+            Ok((None, Some(RopeFrequencyScaling::Banded(scaling))))
         }
         Some(other) => Err(ProductionIngestionError::UnsupportedFormat {
             reason: format!("config.json's rope_scaling type '{other}' is not supported"),
@@ -377,7 +377,7 @@ mod tests {
         assert_eq!(config.rope_scaling_factor, None);
         assert_eq!(
             config.rope_frequency_scaling,
-            Some(RopeFrequencyScaling::Llama3(RopeLlama3Scaling {
+            Some(RopeFrequencyScaling::Banded(RopeBandedFrequencyScaling {
                 factor: 32.0,
                 low_freq_factor: 1.0,
                 high_freq_factor: 4.0,
