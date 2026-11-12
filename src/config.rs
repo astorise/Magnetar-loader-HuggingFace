@@ -246,6 +246,7 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
         // `self_attn.{q,k,v}_proj` bias tensors, the only real evidence
         // this ever needs.
         attention_bias: false,
+        mixture_of_experts: None,
         bos_token_id: raw.bos_token_id,
         eos_token_id: raw.eos_token_id.as_ref().and_then(RawEosTokenId::first),
     };
