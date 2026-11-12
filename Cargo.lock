@@ -886,11 +886,53 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc04a4c58212d57930a24bf47d3fa87485264a3a054e9c10e042eb373573ad3c"
 
 [[package]]
+name = "magnetar-core"
+version = "1.0.0"
+dependencies = [
+ "ed25519-dalek",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "magnetar-engine"
+version = "1.0.0"
+dependencies = [
+ "ed25519-dalek",
+ "magnetar-core",
+ "magnetar-graph",
+ "magnetar-model",
+ "serde",
+ "serde_norway",
+ "sha2 0.11.0",
+ "wasmtime",
+]
+
+[[package]]
 name = "magnetar-format-safetensors"
 version = "1.0.0"
 dependencies = [
  "magnetar-runtime",
  "serde_json",
+]
+
+[[package]]
+name = "magnetar-graph"
+version = "1.0.0"
+dependencies = [
+ "magnetar-core",
+]
+
+[[package]]
+name = "magnetar-kernel"
+version = "1.0.0"
+dependencies = [
+ "flate2",
+ "magnetar-core",
+ "magnetar-graph",
+ "magnetar-model",
+ "serde_json",
+ "sha2 0.11.0",
+ "tar",
 ]
 
 [[package]]
@@ -908,11 +950,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnetar-model"
+version = "1.0.0"
+dependencies = [
+ "ed25519-dalek",
+ "magnetar-core",
+ "magnetar-graph",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "magnetar-runtime"
 version = "1.0.0"
 dependencies = [
  "ed25519-dalek",
  "flate2",
+ "magnetar-core",
+ "magnetar-engine",
+ "magnetar-graph",
+ "magnetar-kernel",
+ "magnetar-model",
  "serde",
  "serde_json",
  "serde_norway",
