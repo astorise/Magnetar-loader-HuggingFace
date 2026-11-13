@@ -23,9 +23,7 @@ concurrency:
 
 jobs:
   module:
-    # Temporary reference to the Magnetar branch that adds the workflow;
-    # becomes `@main` once that branch is merged.
-    uses: astorise/Magnetar/.github/workflows/submodule-ci.yml@claude/awesome-davinci-t65edq
+    uses: astorise/Magnetar/.github/workflows/submodule-ci.yml@main
     with:
       module-path: loaders/huggingface
       siblings: formats/safetensors
