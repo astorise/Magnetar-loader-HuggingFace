@@ -1,0 +1,31 @@
+name: CI
+
+# This repository's own checks (Magnetar's `add-submodule-ci`): formatting,
+# Clippy, tests with the committed lockfile and cargo-deny, on every pull
+# request and every push to main. The checks are defined once, in
+# Magnetar's reusable workflow; this file only names the module.
+#
+# The crate depends on `magnetar-runtime` through a relative path, so the
+# reusable workflow builds it inside a Magnetar checkout: the Magnetar
+# branch named like this repository's branch when it exists, otherwise
+# Magnetar's main.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  module:
+    # Temporary reference to the Magnetar branch that adds the workflow;
+    # becomes `@main` once that branch is merged.
+    uses: astorise/Magnetar/.github/workflows/submodule-ci.yml@claude/awesome-davinci-t65edq
+    with:
+      module-path: loaders/huggingface
+      siblings: formats/safetensors
