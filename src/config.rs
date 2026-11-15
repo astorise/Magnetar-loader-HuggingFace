@@ -3,7 +3,9 @@
 //! [`HfConfigMetadata`] contracts (`implement-production-qwen-model-loading`
 //! task group 3, Decision 5).
 
-use magnetar_runtime::model::{ModelArchitectureConfig, RopeFrequencyScaling};
+use magnetar_runtime::model::{
+    LayerSpec, MixtureOfExpertsConfig, ModelArchitectureConfig, RopeFrequencyScaling,
+};
 use magnetar_runtime::model_format_roadmap::{HfConfigMetadata, HfRopeMetadata};
 use magnetar_runtime::operator::RopeBandedFrequencyScaling;
 use magnetar_runtime::production_model_ingestion::ProductionIngestionError;
@@ -49,6 +51,63 @@ struct RawHfConfig {
     max_position_embeddings: Option<u64>,
     #[serde(default)]
     hidden_act: Option<String>,
+    // Layered decoders (`per-layer-kv-geometry`): read by `layered_config`.
+    /// One `"sliding_attention"` or `"full_attention"` per layer.
+    #[serde(default)]
+    layer_types: Option<Vec<String>>,
+    #[serde(default)]
+    sliding_window: Option<u32>,
+    /// The head width of `full_attention` layers, when it differs.
+    #[serde(default)]
+    global_head_dim: Option<u64>,
+    /// The KV heads of `full_attention` layers, used with `attention_k_eq_v`.
+    #[serde(default)]
+    num_global_key_value_heads: Option<u32>,
+    /// `full_attention` layers have no V projection: V is the raw K
+    /// projection.
+    #[serde(default)]
+    attention_k_eq_v: Option<bool>,
+    /// RoPE, either flat (`{"rope_theta": ..., "rope_type": ...}`, newer
+    /// `transformers` releases) or per layer type
+    /// (`{"sliding_attention": {...}, ...}`); read by [`rope_parameters`].
+    #[serde(default)]
+    rope_parameters: Option<serde_json::Value>,
+    /// The last this many layers attend over the K/V of the last earlier
+    /// layer of their type.
+    #[serde(default)]
+    num_kv_shared_layers: Option<u32>,
+    /// KV-shared layers' feed-forward is twice `intermediate_size`.
+    #[serde(default)]
+    use_double_wide_mlp: Option<bool>,
+    #[serde(default)]
+    final_logit_softcapping: Option<f64>,
+    /// Per-layer input embeddings' width; `0` means none.
+    #[serde(default)]
+    hidden_size_per_layer_input: Option<u32>,
+    /// `"all"` makes every token attend bidirectionally.
+    #[serde(default)]
+    use_bidirectional_attention: Option<String>,
+    #[serde(default)]
+    enable_moe_block: Option<bool>,
+    #[serde(default)]
+    num_experts: Option<u32>,
+    #[serde(default)]
+    top_k_experts: Option<u32>,
+    #[serde(default)]
+    moe_intermediate_size: Option<u64>,
+    #[serde(default)]
+    expert_intermediate_size: Option<u64>,
+}
+
+/// One layer type's RoPE in `rope_parameters`, or the whole of a flat one.
+#[derive(Debug, Default, Deserialize)]
+struct RawRopeParameters {
+    #[serde(default)]
+    rope_theta: Option<f64>,
+    #[serde(default)]
+    rope_type: Option<String>,
+    #[serde(default)]
+    partial_rotary_factor: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,6 +215,204 @@ fn required<T>(value: Option<T>, field: &str) -> Result<T, ProductionIngestionEr
     })
 }
 
+/// `rope_parameters` read as one entry per layer type (every value an
+/// object), or as one flat entry under the key `""`.
+fn rope_parameters(
+    raw: &RawHfConfig,
+) -> Result<BTreeMap<String, RawRopeParameters>, ProductionIngestionError> {
+    let malformed = |error: serde_json::Error| ProductionIngestionError::MalformedMetadata {
+        reason: format!("config.json's rope_parameters is malformed: {error}"),
+    };
+    let Some(value) = &raw.rope_parameters else {
+        return Ok(BTreeMap::new());
+    };
+    let per_type = value
+        .as_object()
+        .is_some_and(|entries| !entries.is_empty() && entries.values().all(|v| v.is_object()));
+    if per_type {
+        serde_json::from_value(value.clone()).map_err(malformed)
+    } else {
+        Ok(BTreeMap::from([(
+            String::new(),
+            serde_json::from_value(value.clone()).map_err(malformed)?,
+        )]))
+    }
+}
+
+/// A layered decoder's per-layer geometry, and the RoPE base of its
+/// sliding layers (the architecture-wide `rope_theta`).
+struct LayeredConfig {
+    layout: Vec<LayerSpec>,
+    rope_theta: f64,
+}
+
+/// The per-layer geometry of a decoder whose `config.json` declares
+/// `layer_types` (`per-layer-kv-geometry`); `None` for uniform layers.
+/// Follows `transformers`' own derivation:
+/// - a `sliding_attention` layer attends over `sliding_window` tokens, a
+///   `full_attention` layer over the whole context;
+/// - `full_attention` layers take `global_head_dim` when declared and, with
+///   `attention_k_eq_v`, `num_global_key_value_heads` and no V projection;
+/// - each layer type takes its `rope_parameters` entry: `default` rotates
+///   the whole head, `proportional` its `partial_rotary_factor`;
+/// - the last `num_kv_shared_layers` layers reuse the K/V of the last
+///   earlier layer of their type, with a twice-wide feed-forward under
+///   `use_double_wide_mlp`.
+fn layered_config(
+    raw: &RawHfConfig,
+    num_hidden_layers: u32,
+    num_attention_heads: u32,
+    head_dim: u64,
+) -> Result<Option<LayeredConfig>, ProductionIngestionError> {
+    let Some(layer_types) = &raw.layer_types else {
+        return Ok(None);
+    };
+    let malformed = |reason: String| ProductionIngestionError::MalformedMetadata { reason };
+    if layer_types.len() != num_hidden_layers as usize {
+        return Err(malformed(format!(
+            "config.json's layer_types has {} entries for {num_hidden_layers} layers",
+            layer_types.len()
+        )));
+    }
+    if raw.use_bidirectional_attention.as_deref() == Some("all") {
+        return Err(ProductionIngestionError::UnsupportedFormat {
+            reason: "config.json declares bidirectional attention for every token; only causal \
+                     decoding is supported"
+                .into(),
+        });
+    }
+    let intermediate_size = raw.intermediate_size.unwrap_or_default();
+    let num_key_value_heads = raw.num_key_value_heads.unwrap_or(num_attention_heads);
+    let k_eq_v = raw.attention_k_eq_v.unwrap_or(false);
+    let rope_parameters = rope_parameters(raw)?;
+    let flat_theta = rope_parameters.get("").and_then(|flat| flat.rope_theta);
+    let default_theta = raw.rope_theta.or(flat_theta).unwrap_or(10_000.0);
+    let rope = |layer_type: &str| -> Result<(f64, Option<f64>), ProductionIngestionError> {
+        let Some(parameters) = rope_parameters.get(layer_type) else {
+            return Ok((default_theta, None));
+        };
+        let theta = parameters.rope_theta.unwrap_or(default_theta);
+        let partial = match parameters.rope_type.as_deref() {
+            None | Some("default") => None,
+            Some("proportional") => parameters.partial_rotary_factor,
+            Some(other) => {
+                return Err(ProductionIngestionError::UnsupportedFormat {
+                    reason: format!(
+                        "config.json's {layer_type} rope_type '{other}' is not supported"
+                    ),
+                });
+            }
+        };
+        Ok((theta, partial.filter(|factor| *factor != 1.0)))
+    };
+    let shared = raw.num_kv_shared_layers.unwrap_or(0) as usize;
+    let first_shared = layer_types.len().checked_sub(shared).ok_or_else(|| {
+        malformed(format!(
+            "config.json shares the K/V of {shared} of {num_hidden_layers} layers"
+        ))
+    })?;
+    let mut layout = Vec::with_capacity(layer_types.len());
+    for (index, layer_type) in layer_types.iter().enumerate() {
+        let full = match layer_type.as_str() {
+            "full_attention" => true,
+            "sliding_attention" => false,
+            other => {
+                return Err(ProductionIngestionError::UnsupportedFormat {
+                    reason: format!("config.json's layer type '{other}' is not supported"),
+                });
+            }
+        };
+        let sliding_window = if full {
+            None
+        } else {
+            Some(raw.sliding_window.ok_or_else(|| {
+                malformed("config.json has sliding layers but no sliding_window".into())
+            })?)
+        };
+        let (rope_theta, partial_rotary_factor) = rope(layer_type)?;
+        let kv_source_layer = if index >= first_shared {
+            let producer = layer_types[..first_shared]
+                .iter()
+                .rposition(|producer| producer == layer_type)
+                .ok_or_else(|| {
+                    malformed(format!(
+                        "config.json's layer {index} shares the K/V of an earlier \
+                         {layer_type} layer, but none computes its own"
+                    ))
+                })?;
+            Some(producer as u32)
+        } else {
+            None
+        };
+        let double_wide = kv_source_layer.is_some() && raw.use_double_wide_mlp.unwrap_or(false);
+        layout.push(LayerSpec {
+            sliding_window,
+            head_dim: if full {
+                raw.global_head_dim.unwrap_or(head_dim)
+            } else {
+                head_dim
+            },
+            num_key_value_heads: match raw.num_global_key_value_heads {
+                Some(heads) if full && k_eq_v => heads,
+                _ => num_key_value_heads,
+            },
+            rope_theta,
+            partial_rotary_factor,
+            value_from_key: full && k_eq_v,
+            kv_source_layer,
+            intermediate_size: intermediate_size * if double_wide { 2 } else { 1 },
+        });
+    }
+    let rope_theta = layout
+        .iter()
+        .find(|layer| layer.sliding_window.is_some())
+        .or(layout.first())
+        .map_or(default_theta, |layer| layer.rope_theta);
+    // Layers that all match the architecture-wide geometry need no layout:
+    // e.g. a uniform decoder whose `layer_types` lists only full attention.
+    let uniform = LayerSpec {
+        sliding_window: None,
+        head_dim,
+        num_key_value_heads,
+        rope_theta,
+        partial_rotary_factor: None,
+        value_from_key: false,
+        kv_source_layer: None,
+        intermediate_size,
+    };
+    if layout.iter().all(|layer| *layer == uniform) {
+        return Ok(None);
+    }
+    Ok(Some(LayeredConfig { layout, rope_theta }))
+}
+
+/// The routed experts a layered decoder's `enable_moe_block` declares,
+/// alongside its dense MLP: each token's top `top_k_experts` of
+/// `num_experts`, renormalized, no shared expert.
+fn mixture_of_experts(
+    raw: &RawHfConfig,
+) -> Result<Option<MixtureOfExpertsConfig>, ProductionIngestionError> {
+    if !raw.enable_moe_block.unwrap_or(false) {
+        return Ok(None);
+    }
+    let field = |value: Option<u64>, name: &str| {
+        value.ok_or_else(|| ProductionIngestionError::MalformedMetadata {
+            reason: format!("config.json enables a mixture of experts but has no '{name}'"),
+        })
+    };
+    let count = |value: Option<u32>, name: &str| field(value.map(u64::from), name);
+    Ok(Some(MixtureOfExpertsConfig {
+        experts: count(raw.num_experts, "num_experts")? as u32,
+        experts_per_token: count(raw.top_k_experts, "top_k_experts")? as u32,
+        expert_intermediate_size: field(
+            raw.moe_intermediate_size.or(raw.expert_intermediate_size),
+            "moe_intermediate_size",
+        )?,
+        shared_expert_intermediate_size: None,
+        normalize_top_k: true,
+    }))
+}
+
 /// Parses and normalizes `bytes` as a Hugging Face-style `config.json`.
 /// Rejects missing/zero/internally-inconsistent architecture values with
 /// structured errors (task 3.3) -- `head_dim`, when absent, is derived as
@@ -163,11 +420,35 @@ fn required<T>(value: Option<T>, field: &str) -> Result<T, ProductionIngestionEr
 /// divide evenly, matching the proposal's "head_dim (or validated
 /// derivation)".
 pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionError> {
-    let raw: RawHfConfig = serde_json::from_slice(bytes).map_err(|error| {
-        ProductionIngestionError::MalformedMetadata {
-            reason: format!("config.json is not valid JSON matching the expected shape: {error}"),
-        }
-    })?;
+    let shape_error = |error: serde_json::Error| ProductionIngestionError::MalformedMetadata {
+        reason: format!("config.json is not valid JSON matching the expected shape: {error}"),
+    };
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(shape_error)?;
+    // A multimodal bundle nests its text decoder's configuration under
+    // `text_config`; the bundle's own `model_type` and `architectures` name
+    // the checkpoint.
+    let nested = value
+        .get("text_config")
+        .filter(|_| value.get("hidden_size").is_none())
+        .cloned();
+    let outer_model_type = nested
+        .as_ref()
+        .and(value.get("model_type"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let outer_architectures: Option<Vec<String>> = nested.as_ref().and_then(|_| {
+        value
+            .get("architectures")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+    });
+    let mut raw: RawHfConfig =
+        serde_json::from_value(nested.unwrap_or(value)).map_err(shape_error)?;
+    if let Some(model_type) = outer_model_type {
+        raw.model_type = Some(model_type);
+    }
+    if let Some(architectures) = outer_architectures {
+        raw.architectures = architectures;
+    }
 
     let hidden_size = required(raw.hidden_size, "hidden_size")?;
     let intermediate_size = required(raw.intermediate_size, "intermediate_size")?;
@@ -175,7 +456,7 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
     let num_attention_heads = required(raw.num_attention_heads, "num_attention_heads")?;
     let num_key_value_heads = raw.num_key_value_heads.unwrap_or(num_attention_heads);
     let vocab_size = required(raw.vocab_size, "vocab_size")?;
-    let model_type = required(raw.model_type, "model_type")?;
+    let model_type = required(raw.model_type.clone(), "model_type")?;
 
     if hidden_size == 0 || intermediate_size == 0 || vocab_size == 0 {
         return Err(ProductionIngestionError::MalformedMetadata {
@@ -218,7 +499,17 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
     }
 
     let rms_norm_eps = raw.rms_norm_eps.unwrap_or(1e-6) as f32;
-    let rope_theta = raw.rope_theta.unwrap_or(10_000.0);
+    let layered = layered_config(&raw, num_hidden_layers, num_attention_heads, head_dim)?;
+    // `rope_theta`, else a flat `rope_parameters`' (newer `transformers`
+    // releases moved it there), else a layered decoder's sliding layers'.
+    let flat_rope_theta = rope_parameters(&raw)?
+        .get("")
+        .and_then(|flat| flat.rope_theta);
+    let rope_theta = raw
+        .rope_theta
+        .or(flat_rope_theta)
+        .or(layered.as_ref().map(|layered| layered.rope_theta))
+        .unwrap_or(10_000.0);
     if rope_theta <= 0.0 {
         return Err(ProductionIngestionError::MalformedMetadata {
             reason: "config.json's rope_theta must be positive".into(),
@@ -246,11 +537,12 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
         // `self_attn.{q,k,v}_proj` bias tensors, the only real evidence
         // this ever needs.
         attention_bias: false,
-        mixture_of_experts: None,
+        mixture_of_experts: mixture_of_experts(&raw)?,
         bos_token_id: raw.bos_token_id,
         eos_token_id: raw.eos_token_id.as_ref().and_then(RawEosTokenId::first),
-        // `layer_layout` and the `1.6.0` options: uniform layers, none.
-        ..ModelArchitectureConfig::default()
+        layer_layout: layered.as_ref().map(|layered| layered.layout.clone()),
+        final_logit_softcapping: raw.final_logit_softcapping,
+        per_layer_input_size: raw.hidden_size_per_layer_input.filter(|size| *size > 0),
     };
     architecture_config.validate().map_err(|error| {
         ProductionIngestionError::MalformedMetadata {
@@ -515,5 +807,200 @@ mod tests {
                 .map(String::as_str),
             Some("bfloat16")
         );
+    }
+}
+
+/// `per-layer-kv-geometry`: the real `config.json` files of the Gemma 4
+/// checkpoints (`google/gemma-4-*-it`, Apache-2.0), whose layer geometry
+/// the per-layer tensor shapes of the same checkpoints confirm.
+#[cfg(test)]
+mod layered_tests {
+    use super::*;
+
+    fn parse_testdata(name: &str) -> ModelArchitectureConfig {
+        let path = format!(
+            "{}/testdata/gemma4/{name}.config.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        parse(&std::fs::read(path).unwrap())
+            .unwrap()
+            .architecture_config
+    }
+
+    #[test]
+    fn e2b_layers_slide_share_kv_and_widen_their_mlp() {
+        let config = parse_testdata("gemma-4-E2B-it");
+        assert_eq!(config.num_hidden_layers, 35);
+        assert_eq!(config.head_dim, 256);
+        assert_eq!(config.num_key_value_heads, 1);
+        assert_eq!(config.rope_theta, 10_000.0);
+        assert_eq!(config.final_logit_softcapping, Some(30.0));
+        assert_eq!(config.per_layer_input_size, Some(256));
+        assert_eq!(config.mixture_of_experts, None);
+        let layout = config.layer_layout.as_ref().unwrap();
+        // A sliding layer: window 512, 256-wide heads, full rotation.
+        let sliding = &layout[0];
+        assert_eq!(sliding.sliding_window, Some(512));
+        assert_eq!(sliding.head_dim, 256);
+        assert_eq!(sliding.num_key_value_heads, 1);
+        assert_eq!(sliding.rope_theta, 10_000.0);
+        assert_eq!(sliding.partial_rotary_factor, None);
+        assert_eq!(sliding.intermediate_size, 6144);
+        // A full layer: whole context, 512-wide heads (q_norm `[512]`),
+        // a quarter of each head rotated with base 1e6, its own V.
+        let full = &layout[4];
+        assert_eq!(full.sliding_window, None);
+        assert_eq!(full.head_dim, 512);
+        assert_eq!(full.num_key_value_heads, 1);
+        assert_eq!(full.rope_theta, 1_000_000.0);
+        assert_eq!(full.partial_rotary_factor, Some(0.25));
+        assert!(!full.value_from_key);
+        // The last 20 layers reuse the K/V of the last earlier layer of
+        // their type (13 sliding, 14 full) and have a 12288-wide MLP.
+        assert!(
+            layout[..15]
+                .iter()
+                .all(|layer| layer.kv_source_layer.is_none())
+        );
+        assert_eq!(layout[15].kv_source_layer, Some(13));
+        assert_eq!(layout[19].kv_source_layer, Some(14));
+        assert_eq!(layout[34].kv_source_layer, Some(14));
+        assert!(
+            layout[15..]
+                .iter()
+                .all(|layer| layer.intermediate_size == 12288)
+        );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn full_layers_of_k_eq_v_checkpoints_take_global_kv_heads_and_no_v() {
+        // 31B: `num_global_key_value_heads = 4`, `attention_k_eq_v`.
+        let config = parse_testdata("gemma-4-31B-it");
+        let layout = config.layer_layout.as_ref().unwrap();
+        assert_eq!(layout.len(), 60);
+        let full: Vec<usize> = (0..60)
+            .filter(|i| layout[*i].sliding_window.is_none())
+            .collect();
+        assert_eq!(full, [5, 11, 17, 23, 29, 35, 41, 47, 53, 59]);
+        for (index, layer) in layout.iter().enumerate() {
+            let is_full = full.contains(&index);
+            assert_eq!(layer.num_key_value_heads, if is_full { 4 } else { 16 });
+            assert_eq!(layer.head_dim, if is_full { 512 } else { 256 });
+            assert_eq!(layer.value_from_key, is_full);
+            assert_eq!(layer.sliding_window, (!is_full).then_some(1024));
+            assert_eq!(layer.kv_source_layer, None);
+        }
+        assert_eq!(config.per_layer_input_size, None);
+    }
+
+    #[test]
+    fn a_mixture_of_experts_checkpoint_routes_renormalized_experts() {
+        let config = parse_testdata("gemma-4-26B-A4B-it");
+        assert_eq!(
+            config.mixture_of_experts,
+            Some(MixtureOfExpertsConfig {
+                experts: 128,
+                experts_per_token: 8,
+                expert_intermediate_size: 704,
+                shared_expert_intermediate_size: None,
+                normalize_top_k: true,
+            })
+        );
+        let layout = config.layer_layout.as_ref().unwrap();
+        // 25 sliding layers have a V projection, 5 full ones derive V.
+        assert_eq!(
+            layout.iter().filter(|layer| !layer.value_from_key).count(),
+            25
+        );
+        assert_eq!(layout[5].num_key_value_heads, 2);
+        assert_eq!(layout[0].num_key_value_heads, 8);
+    }
+
+    #[test]
+    fn e4b_shares_kv_without_widening_its_mlp() {
+        let config = parse_testdata("gemma-4-E4B-it");
+        let layout = config.layer_layout.as_ref().unwrap();
+        assert_eq!(layout.len(), 42);
+        // 18 shared layers; the last unshared ones are 22 (sliding) and
+        // 23 (full).
+        assert_eq!(layout[24].kv_source_layer, Some(22));
+        assert_eq!(layout[29].kv_source_layer, Some(23));
+        assert!(layout.iter().all(|layer| layer.intermediate_size == 10240));
+    }
+
+    #[test]
+    fn unsupported_layered_forms_are_refused() {
+        let mut value: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(format!(
+                "{}/testdata/gemma4/gemma-4-31B-it.config.json",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let text = value.get_mut("text_config").unwrap();
+        text["use_bidirectional_attention"] = "all".into();
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(matches!(
+            parse(&bytes),
+            Err(ProductionIngestionError::UnsupportedFormat { .. })
+        ));
+        let text = value.get_mut("text_config").unwrap();
+        text["use_bidirectional_attention"] = serde_json::Value::Null;
+        text["rope_parameters"]["full_attention"]["rope_type"] = "yarn".into();
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(matches!(
+            parse(&bytes),
+            Err(ProductionIngestionError::UnsupportedFormat { .. })
+        ));
+        let text = value.get_mut("text_config").unwrap();
+        text["rope_parameters"]["full_attention"]["rope_type"] = "proportional".into();
+        text["layer_types"].as_array_mut().unwrap().pop();
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(matches!(
+            parse(&bytes),
+            Err(ProductionIngestionError::MalformedMetadata { .. })
+        ));
+    }
+
+    /// A uniform decoder listing only full-attention layers, with a flat
+    /// `rope_parameters` (newer `transformers` releases), keeps no layout
+    /// and takes its RoPE base from `rope_parameters`.
+    #[test]
+    fn uniform_layer_types_and_flat_rope_parameters_add_no_layout() {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "model_type": "qwen2",
+            "hidden_size": 896,
+            "intermediate_size": 4864,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 14,
+            "num_key_value_heads": 2,
+            "vocab_size": 151936,
+            "layer_types": ["full_attention", "full_attention"],
+            "sliding_window": null,
+            "rope_parameters": {"rope_theta": 1000000.0, "rope_type": "default"}
+        }))
+        .unwrap();
+        let config = parse(&bytes).unwrap().architecture_config;
+        assert_eq!(config.layer_layout, None);
+        assert_eq!(config.rope_theta, 1_000_000.0);
+    }
+
+    #[test]
+    fn a_nested_text_config_keeps_the_bundle_model_type() {
+        let bytes = std::fs::read(format!(
+            "{}/testdata/gemma4/gemma-4-31B-it.config.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let parsed = parse(&bytes).unwrap();
+        assert_eq!(parsed.metadata.model_type, "gemma4");
+        assert_eq!(
+            parsed.metadata.architectures,
+            vec!["Gemma4ForConditionalGeneration".to_string()]
+        );
+        assert_eq!(parsed.architecture_config.hidden_size, 5376);
+        assert!(parsed.architecture_config.tie_word_embeddings);
     }
 }

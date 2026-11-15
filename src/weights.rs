@@ -237,6 +237,15 @@ pub fn discover_and_parse_weights(
     // placeholder has no location entry (its real bytes come from its
     // four raw siblings' own, untouched locations instead), so its
     // `.remove()` below is a harmless no-op.
+    // A multimodal bundle's vision and audio towers are not part of the
+    // text decoder.
+    tensors.retain(|tensor| {
+        let text = !crate::naming::is_non_text_tensor(&tensor.name);
+        if !text {
+            payload_source.locations.remove(&tensor.name);
+        }
+        text
+    });
     let mut renamed_locations = BTreeMap::new();
     for tensor in &mut tensors {
         let canonical = crate::naming::normalize_tensor_name(&tensor.name)?;
@@ -534,6 +543,41 @@ mod tests {
             .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
         assert_eq!(values, vec![1.0, 2.0]);
+    }
+
+    /// A multimodal bundle's vision and audio towers stay out of the
+    /// inventory; its text decoder takes the canonical names.
+    #[test]
+    fn a_multimodal_bundle_keeps_only_its_text_decoder() {
+        let dir = tempfile::tempdir().unwrap();
+        write_safetensors_file(
+            &dir.path().join(SINGLE_FILE_NAME),
+            &[
+                ("model.language_model.embed_tokens.weight", &[1.0, 2.0]),
+                ("model.language_model.norm.weight", &[3.0]),
+                ("model.vision_tower.patch_embedder.weight", &[4.0]),
+                ("model.embed_audio.embedding_projection.weight", &[5.0]),
+            ],
+        );
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        let (tensors, _shards, _names, payload_source) =
+            discover_and_parse_weights(&source).unwrap();
+        let mut names: Vec<&str> = tensors.iter().map(|tensor| tensor.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["final_norm", "token_embedding"]);
+        let norm = tensors.iter().find(|t| t.name == "final_norm").unwrap();
+        let bytes = payload_source
+            .read_payload(&ProductionPayloadRange {
+                identity: norm.name.clone(),
+                offset: norm.offset_bytes.unwrap(),
+                length: norm.size_bytes.unwrap(),
+                digest: None,
+            })
+            .unwrap();
+        assert_eq!(bytes, 3.0f32.to_le_bytes());
     }
 
     #[test]
