@@ -249,6 +249,8 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
         mixture_of_experts: None,
         bos_token_id: raw.bos_token_id,
         eos_token_id: raw.eos_token_id.as_ref().and_then(RawEosTokenId::first),
+        // `layer_layout` and the `1.6.0` options: uniform layers, none.
+        ..ModelArchitectureConfig::default()
     };
     architecture_config.validate().map_err(|error| {
         ProductionIngestionError::MalformedMetadata {
