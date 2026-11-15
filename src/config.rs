@@ -239,15 +239,16 @@ fn rope_parameters(
     }
 }
 
-/// A layered decoder's per-layer geometry, and the RoPE base of its
-/// sliding layers (the architecture-wide `rope_theta`).
+/// A layered decoder's per-layer geometry (`None` when every layer matches
+/// the architecture-wide one), and the RoPE base of its sliding layers (the
+/// architecture-wide `rope_theta`), kept even when the layout is dropped.
 struct LayeredConfig {
-    layout: Vec<LayerSpec>,
+    layout: Option<Vec<LayerSpec>>,
     rope_theta: f64,
 }
 
 /// The per-layer geometry of a decoder whose `config.json` declares
-/// `layer_types` (`per-layer-kv-geometry`); `None` for uniform layers.
+/// `layer_types` (`per-layer-kv-geometry`); `None` without `layer_types`.
 /// Follows `transformers`' own derivation:
 /// - a `sliding_attention` layer attends over `sliding_window` tokens, a
 ///   `full_attention` layer over the whole context;
@@ -380,9 +381,7 @@ fn layered_config(
         kv_source_layer: None,
         intermediate_size,
     };
-    if layout.iter().all(|layer| *layer == uniform) {
-        return Ok(None);
-    }
+    let layout = (!layout.iter().all(|layer| *layer == uniform)).then_some(layout);
     Ok(Some(LayeredConfig { layout, rope_theta }))
 }
 
@@ -540,7 +539,7 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
         mixture_of_experts: mixture_of_experts(&raw)?,
         bos_token_id: raw.bos_token_id,
         eos_token_id: raw.eos_token_id.as_ref().and_then(RawEosTokenId::first),
-        layer_layout: layered.as_ref().map(|layered| layered.layout.clone()),
+        layer_layout: layered.and_then(|layered| layered.layout),
         final_logit_softcapping: raw.final_logit_softcapping,
         per_layer_input_size: raw.hidden_size_per_layer_input.filter(|size| *size > 0),
     };
@@ -980,6 +979,29 @@ mod layered_tests {
             "layer_types": ["full_attention", "full_attention"],
             "sliding_window": null,
             "rope_parameters": {"rope_theta": 1000000.0, "rope_type": "default"}
+        }))
+        .unwrap();
+        let config = parse(&bytes).unwrap().architecture_config;
+        assert_eq!(config.layer_layout, None);
+        assert_eq!(config.rope_theta, 1_000_000.0);
+    }
+
+    /// A uniform decoder whose only RoPE base is its per-type
+    /// `rope_parameters` entry keeps that base when its layout is dropped.
+    #[test]
+    fn a_dropped_uniform_layout_keeps_its_per_type_rope_base() {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "model_type": "qwen2",
+            "hidden_size": 896,
+            "intermediate_size": 4864,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 14,
+            "num_key_value_heads": 2,
+            "vocab_size": 151936,
+            "layer_types": ["full_attention", "full_attention"],
+            "rope_parameters": {
+                "full_attention": {"rope_theta": 1000000.0, "rope_type": "default"}
+            }
         }))
         .unwrap();
         let config = parse(&bytes).unwrap().architecture_config;
