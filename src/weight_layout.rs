@@ -35,7 +35,10 @@ use std::collections::{BTreeMap, BTreeSet};
 /// two-dimensional check in [`swap_declared_projection_shapes`]/
 /// [`TransposingPayloadSource`] regardless).
 fn is_transposed_projection(canonical_name: &str) -> bool {
-    canonical_name == "lm_head" || canonical_name.contains("proj")
+    canonical_name == "lm_head"
+        || canonical_name.contains("proj")
+        // A per-layer input gate is an `nn.Linear` too.
+        || canonical_name.ends_with(".per_layer_input_gate")
 }
 
 /// Swaps every 2D projection tensor's declared shape from
