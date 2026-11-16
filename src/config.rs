@@ -826,6 +826,48 @@ mod layered_tests {
             .architecture_config
     }
 
+    /// `gemma-4-12B-it` declares `gemma4_unified`, whose text decoder is
+    /// Gemma 4's dense one: five sliding layers to one full layer, full
+    /// layers deriving V from K, no per-layer inputs, no experts.
+    #[test]
+    fn a_unified_bundle_takes_its_text_decoders_layout() {
+        let path = format!(
+            "{}/testdata/gemma4/gemma-4-12B-it.config.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let parsed = parse(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(parsed.metadata.model_type, "gemma4_unified");
+        let config = parsed.architecture_config;
+        assert_eq!(config.num_hidden_layers, 48);
+        assert_eq!(config.hidden_size, 3840);
+        assert_eq!(config.head_dim, 256);
+        assert_eq!(config.num_key_value_heads, 8);
+        assert_eq!(config.final_logit_softcapping, Some(30.0));
+        assert_eq!(config.per_layer_input_size, None);
+        assert_eq!(config.mixture_of_experts, None);
+        let layout = config.layer_layout.as_ref().unwrap();
+        for (index, layer) in layout.iter().enumerate() {
+            let full = index % 6 == 5;
+            assert_eq!(layer.sliding_window.is_none(), full, "layer {index}");
+            assert_eq!(layer.kv_source_layer, None, "layer {index}");
+            assert_eq!(layer.intermediate_size, 15360, "layer {index}");
+            if full {
+                assert_eq!(layer.head_dim, 512);
+                assert_eq!(layer.num_key_value_heads, 1);
+                assert!(layer.value_from_key);
+                assert_eq!(layer.rope_theta, 1_000_000.0);
+                assert_eq!(layer.partial_rotary_factor, Some(0.25));
+            } else {
+                assert_eq!(layer.sliding_window, Some(1024));
+                assert_eq!(layer.head_dim, 256);
+                assert_eq!(layer.num_key_value_heads, 8);
+                assert!(!layer.value_from_key);
+                assert_eq!(layer.rope_theta, 10_000.0);
+                assert_eq!(layer.partial_rotary_factor, None);
+            }
+        }
+    }
+
     #[test]
     fn e2b_layers_slide_share_kv_and_widen_their_mlp() {
         let config = parse_testdata("gemma-4-E2B-it");

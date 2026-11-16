@@ -14,12 +14,14 @@ use magnetar_runtime::production_model_ingestion::ProductionIngestionError;
 
 /// The prefixes of a multimodal bundle's non-text towers. Their tensors are
 /// not part of the text decoder and are left out of the inventory.
-const NON_TEXT_PREFIXES: [&str; 5] = [
+const NON_TEXT_PREFIXES: [&str; 6] = [
     "model.vision_tower.",
     "model.audio_tower.",
     "model.embed_vision.",
     "model.embed_audio.",
     "model.multi_modal_projector.",
+    // `gemma4_unified` bundles embed image patches directly.
+    "model.vision_embedder.",
 ];
 
 /// Whether `raw` belongs to a multimodal bundle's vision or audio tower
@@ -326,6 +328,9 @@ mod layered_tests {
         ));
         assert!(is_non_text_tensor(
             "model.embed_audio.embedding_projection.weight"
+        ));
+        assert!(is_non_text_tensor(
+            "model.vision_embedder.patch_dense.weight"
         ));
         assert!(!is_non_text_tensor("model.language_model.norm.weight"));
     }
