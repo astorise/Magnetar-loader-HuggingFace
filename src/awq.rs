@@ -346,6 +346,11 @@ pub struct AwqDequantizingPayloadSource<S> {
 }
 
 impl<S> AwqDequantizingPayloadSource<S> {
+    /// The source the raw tensors are read from.
+    pub(crate) fn inner(&self) -> &S {
+        &self.inner
+    }
+
     pub fn new(inner: S, projections: Vec<AwqProjection>) -> Self {
         Self {
             inner,
