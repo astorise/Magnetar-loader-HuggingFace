@@ -1268,4 +1268,145 @@ mod tests {
             );
         }
     }
+
+    /// The tensor names and shapes `transformers` 5.23 saves for
+    /// `testdata/deepseek/tiny-deepseek-v2.config.json` (a dense first
+    /// layer, then two layers of 4 routed and 2 shared experts, latent
+    /// attention without a low-rank query), each stored as `[out, in]`.
+    fn tiny_latent_attention_tensors() -> Vec<(String, Vec<u64>)> {
+        let mut tensors = vec![
+            ("model.embed_tokens.weight".to_string(), vec![64, 32]),
+            ("model.norm.weight".to_string(), vec![32]),
+            ("lm_head.weight".to_string(), vec![64, 32]),
+        ];
+        for layer in 0..3 {
+            let name = |field: &str| format!("model.layers.{layer}.{field}.weight");
+            for (field, shape) in [
+                ("input_layernorm", vec![32]),
+                ("post_attention_layernorm", vec![32]),
+                ("self_attn.q_proj", vec![20, 32]),
+                ("self_attn.kv_a_proj_with_mqa", vec![16, 32]),
+                ("self_attn.kv_a_layernorm", vec![12]),
+                ("self_attn.kv_b_proj", vec![22, 12]),
+                ("self_attn.o_proj", vec![32, 10]),
+            ] {
+                tensors.push((name(field), shape));
+            }
+            if layer == 0 {
+                tensors.push((name("mlp.gate_proj"), vec![48, 32]));
+                tensors.push((name("mlp.up_proj"), vec![48, 32]));
+                tensors.push((name("mlp.down_proj"), vec![32, 48]));
+                continue;
+            }
+            tensors.push((name("mlp.gate"), vec![4, 32]));
+            for expert in 0..4 {
+                tensors.push((
+                    name(&format!("mlp.experts.{expert}.gate_proj")),
+                    vec![16, 32],
+                ));
+                tensors.push((name(&format!("mlp.experts.{expert}.up_proj")), vec![16, 32]));
+                tensors.push((
+                    name(&format!("mlp.experts.{expert}.down_proj")),
+                    vec![32, 16],
+                ));
+            }
+            tensors.push((name("mlp.shared_experts.gate_proj"), vec![32, 32]));
+            tensors.push((name("mlp.shared_experts.up_proj"), vec![32, 32]));
+            tensors.push((name("mlp.shared_experts.down_proj"), vec![32, 32]));
+        }
+        tensors
+    }
+
+    /// A latent-attention checkpoint ingests into the tensors its Model
+    /// Component requests, each the shape the Runtime expects
+    /// (`express-latent-attention-forms`).
+    #[test]
+    fn ingests_a_latent_attention_bundle_into_the_requested_tensors() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/testdata/deepseek/tiny-deepseek-v2.config.json"
+            ),
+            dir.path().join("config.json"),
+        )
+        .unwrap();
+        let mut header = serde_json::Map::new();
+        let mut data = Vec::new();
+        for (name, shape) in tiny_latent_attention_tensors() {
+            let start = data.len() as u64;
+            data.resize(data.len() + shape.iter().product::<u64>() as usize * 4, 0);
+            header.insert(
+                name,
+                serde_json::json!({
+                    "dtype": "F32",
+                    "shape": shape,
+                    "data_offsets": [start, data.len()],
+                }),
+            );
+        }
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut file = fs::File::create(dir.path().join("model.safetensors")).unwrap();
+        file.write_all(&(header_bytes.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header_bytes).unwrap();
+        file.write_all(&data).unwrap();
+        drop(file);
+
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        let result = HuggingFaceIngestor::new()
+            .ingest(&source)
+            .expect("bundle ingests");
+        let config = result.manifest.architecture_config.clone().unwrap();
+        let mla = config.latent_attention.unwrap();
+        let shapes: BTreeMap<&str, &[u64]> = result
+            .manifest
+            .tensors
+            .iter()
+            .map(|tensor| (tensor.name.as_str(), tensor.shape.as_slice()))
+            .collect();
+
+        let mut expected: BTreeMap<String, Vec<u64>> = BTreeMap::from([
+            ("token_embedding".to_string(), vec![64, 32]),
+            ("final_norm".to_string(), vec![32]),
+            ("lm_head".to_string(), vec![32, 64]),
+        ]);
+        for layer in 0..3 {
+            for (projection, shape) in magnetar_runtime::latent_attention_projection_shapes(
+                32,
+                u64::from(config.num_attention_heads),
+                &mla,
+            ) {
+                expected.insert(format!("layers.{layer}.{projection}"), shape);
+            }
+            expected.insert(format!("layers.{layer}.input_norm"), vec![32]);
+            expected.insert(format!("layers.{layer}.post_attn_norm"), vec![32]);
+            if layer == 0 {
+                expected.insert("layers.0.mlp.gate_proj".into(), vec![32, 48]);
+                expected.insert("layers.0.mlp.up_proj".into(), vec![32, 48]);
+                expected.insert("layers.0.mlp.down_proj".into(), vec![48, 32]);
+                continue;
+            }
+            for (name, shape) in [
+                ("router_proj", vec![32, 4]),
+                ("experts_gate_proj", vec![32, 64]),
+                ("experts_up_proj", vec![32, 64]),
+                ("experts_down_proj", vec![16, 128]),
+                ("shared_gate_proj", vec![32, 32]),
+                ("shared_up_proj", vec![32, 32]),
+                ("shared_down_proj", vec![32, 32]),
+            ] {
+                expected.insert(format!("layers.{layer}.moe.{name}"), shape);
+            }
+        }
+        let expected: BTreeMap<&str, &[u64]> = expected
+            .iter()
+            .map(|(name, shape)| (name.as_str(), shape.as_slice()))
+            .collect();
+        assert_eq!(shapes, expected);
+        assert_eq!(config.moe_layers, Some(vec![false, true, true]));
+    }
 }

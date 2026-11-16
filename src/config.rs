@@ -4,10 +4,11 @@
 //! task group 3, Decision 5).
 
 use magnetar_runtime::model::{
+    ExpertGroupScore, ExpertGroups, ExpertRoutingConfig, ExpertScoring, LatentAttentionConfig,
     LayerSpec, MixtureOfExpertsConfig, ModelArchitectureConfig, RopeFrequencyScaling,
 };
 use magnetar_runtime::model_format_roadmap::{HfConfigMetadata, HfRopeMetadata};
-use magnetar_runtime::operator::RopeBandedFrequencyScaling;
+use magnetar_runtime::operator::{RopeBandedFrequencyScaling, RopeYarnFrequencyScaling};
 use magnetar_runtime::production_model_ingestion::ProductionIngestionError;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -97,6 +98,43 @@ struct RawHfConfig {
     moe_intermediate_size: Option<u64>,
     #[serde(default)]
     expert_intermediate_size: Option<u64>,
+    // Multi-head latent attention and its experts (`express-latent-
+    // attention-forms`): read by `latent_attention` and `routed_experts`.
+    #[serde(default)]
+    q_lora_rank: Option<u32>,
+    #[serde(default)]
+    kv_lora_rank: Option<u32>,
+    #[serde(default)]
+    qk_nope_head_dim: Option<u64>,
+    #[serde(default)]
+    qk_rope_head_dim: Option<u64>,
+    #[serde(default)]
+    v_head_dim: Option<u64>,
+    #[serde(default)]
+    n_routed_experts: Option<u32>,
+    #[serde(default)]
+    num_experts_per_tok: Option<u32>,
+    #[serde(default)]
+    n_shared_experts: Option<u64>,
+    #[serde(default)]
+    first_k_dense_replace: Option<u32>,
+    #[serde(default)]
+    moe_layer_freq: Option<u32>,
+    /// `greedy`, `group_limited_greedy` (groups by their best expert) or
+    /// `noaux_tc` (groups by their two best, with a selection bias).
+    #[serde(default)]
+    topk_method: Option<String>,
+    #[serde(default)]
+    n_group: Option<u32>,
+    #[serde(default)]
+    topk_group: Option<u32>,
+    #[serde(default)]
+    routed_scaling_factor: Option<f64>,
+    #[serde(default)]
+    norm_topk_prob: Option<bool>,
+    /// `softmax` (absent) or `sigmoid`.
+    #[serde(default)]
+    scoring_func: Option<String>,
 }
 
 /// One layer type's RoPE in `rope_parameters`, or the whole of a flat one.
@@ -125,6 +163,19 @@ struct RawRopeScaling {
     high_freq_factor: Option<f64>,
     #[serde(default)]
     original_max_position_embeddings: Option<u64>,
+    // YaRN.
+    #[serde(default)]
+    beta_fast: Option<f64>,
+    #[serde(default)]
+    beta_slow: Option<f64>,
+    #[serde(default)]
+    mscale: Option<f64>,
+    #[serde(default)]
+    mscale_all_dim: Option<f64>,
+    #[serde(default)]
+    attention_factor: Option<f64>,
+    #[serde(default)]
+    truncate: Option<bool>,
 }
 
 impl RawRopeScaling {
@@ -136,7 +187,7 @@ impl RawRopeScaling {
 /// The normalized RoPE scaling a `rope_scaling` object declares: a linear
 /// position factor (`linear`, or a bare `factor` with no type -- this
 /// loader's behaviour before types were read), a per-frequency scheme
-/// (`llama3`), or nothing (`default`). Any other scheme (`yarn`, `dynamic`,
+/// (`llama3`, `yarn`), or nothing (`default`). Any other scheme (`dynamic`,
 /// `longrope`, ...) is refused: ingesting it as unscaled or as a plain
 /// factor would load a checkpoint whose every token is then wrong.
 fn rope_scaling(
@@ -171,10 +222,164 @@ fn rope_scaling(
                 .map_err(|reason| ProductionIngestionError::MalformedMetadata { reason })?;
             Ok((None, Some(RopeFrequencyScaling::Banded(scaling))))
         }
+        Some("yarn") => Ok((None, Some(yarn_scaling(raw)?))),
         Some(other) => Err(ProductionIngestionError::UnsupportedFormat {
             reason: format!("config.json's rope_scaling type '{other}' is not supported"),
         }),
     }
+}
+
+/// YaRN as `transformers` reads it (`_compute_yarn_parameters`): `beta_fast`
+/// 32 and `beta_slow` 1 unless declared, a truncated correction range unless
+/// `truncate` is false, and `cos`/`sin` multiplied by `attention_factor`,
+/// else by `mscale(factor, mscale) / mscale(factor, mscale_all_dim)` when
+/// both are declared, else by `mscale(factor)`, where `mscale(s, m) =
+/// 0.1 m ln(s) + 1` for `s > 1`.
+fn yarn_scaling(raw: &RawRopeScaling) -> Result<RopeFrequencyScaling, ProductionIngestionError> {
+    let malformed = |what: &str| ProductionIngestionError::MalformedMetadata {
+        reason: format!("config.json's yarn rope scaling has no '{what}'"),
+    };
+    let factor = raw.factor.ok_or_else(|| malformed("factor"))?;
+    let original_context_length = raw
+        .original_max_position_embeddings
+        .ok_or_else(|| malformed("original_max_position_embeddings"))?;
+    let mscale = |scale: f64, multiplier: f64| {
+        if scale <= 1.0 {
+            1.0
+        } else {
+            0.1 * multiplier * scale.ln() + 1.0
+        }
+    };
+    let attention_factor = match (raw.attention_factor, raw.mscale, raw.mscale_all_dim) {
+        (Some(factor), _, _) => factor,
+        (None, Some(m), Some(all)) if m != 0.0 && all != 0.0 => {
+            mscale(factor, m) / mscale(factor, all)
+        }
+        _ => mscale(factor, 1.0),
+    };
+    let scaling = RopeYarnFrequencyScaling {
+        factor,
+        original_context_length,
+        beta_fast: raw.beta_fast.unwrap_or(32.0),
+        beta_slow: raw.beta_slow.unwrap_or(1.0),
+        attention_factor,
+        truncate: raw.truncate.unwrap_or(true),
+    };
+    scaling
+        .validate()
+        .map_err(|reason| ProductionIngestionError::MalformedMetadata { reason })?;
+    Ok(RopeFrequencyScaling::Yarn {
+        scaling,
+        mscale_all_dim: raw.mscale_all_dim.filter(|value| *value != 0.0),
+    })
+}
+
+/// Multi-head latent attention, when `config.json` declares a
+/// `kv_lora_rank` (`express-latent-attention-forms`): the low ranks and the
+/// three head widths, every one required.
+fn latent_attention(
+    raw: &RawHfConfig,
+) -> Result<Option<LatentAttentionConfig>, ProductionIngestionError> {
+    let Some(kv_lora_rank) = raw.kv_lora_rank else {
+        return Ok(None);
+    };
+    let field = |value: Option<u64>, name: &str| {
+        value.ok_or_else(|| ProductionIngestionError::MalformedMetadata {
+            reason: format!("config.json declares a kv_lora_rank but no '{name}'"),
+        })
+    };
+    Ok(Some(LatentAttentionConfig {
+        q_lora_rank: raw.q_lora_rank,
+        kv_lora_rank,
+        qk_nope_head_dim: field(raw.qk_nope_head_dim, "qk_nope_head_dim")?,
+        qk_rope_head_dim: field(raw.qk_rope_head_dim, "qk_rope_head_dim")?,
+        v_head_dim: field(raw.v_head_dim, "v_head_dim")?,
+    }))
+}
+
+/// The routed experts `n_routed_experts` declares (DeepSeekMoE-style
+/// checkpoints): the experts, their always-active shared experts summed into
+/// one of `n_shared_experts * moe_intermediate_size`, the layers whose MLP
+/// they are (from layer `first_k_dense_replace` on, every `moe_layer_freq`
+/// layers; the others dense), and their routing.
+#[allow(clippy::type_complexity)]
+fn routed_experts(
+    raw: &RawHfConfig,
+    layers: u32,
+) -> Result<
+    Option<(
+        MixtureOfExpertsConfig,
+        Option<Vec<bool>>,
+        ExpertRoutingConfig,
+    )>,
+    ProductionIngestionError,
+> {
+    let Some(experts) = raw.n_routed_experts else {
+        return Ok(None);
+    };
+    let malformed = |reason: String| ProductionIngestionError::MalformedMetadata { reason };
+    let experts_per_token = raw.num_experts_per_tok.ok_or_else(|| {
+        malformed("config.json declares routed experts but no 'num_experts_per_tok'".into())
+    })?;
+    let expert_intermediate_size = raw.moe_intermediate_size.ok_or_else(|| {
+        malformed("config.json declares routed experts but no 'moe_intermediate_size'".into())
+    })?;
+    let moe = MixtureOfExpertsConfig {
+        experts,
+        experts_per_token,
+        expert_intermediate_size,
+        shared_expert_intermediate_size: raw
+            .n_shared_experts
+            .filter(|count| *count > 0)
+            .map(|count| count * expert_intermediate_size),
+        normalize_top_k: raw.norm_topk_prob.unwrap_or(false),
+    };
+    let first_moe = raw.first_k_dense_replace.unwrap_or(0);
+    let frequency = raw.moe_layer_freq.unwrap_or(1).max(1);
+    let routed: Vec<bool> = (0..layers)
+        .map(|layer| layer >= first_moe && layer % frequency == 0)
+        .collect();
+    let moe_layers = (!routed.iter().all(|routed| *routed)).then_some(routed);
+    let scoring = match raw.scoring_func.as_deref() {
+        None | Some("softmax") => ExpertScoring::Softmax,
+        Some("sigmoid") => ExpertScoring::Sigmoid,
+        Some(other) => {
+            return Err(ProductionIngestionError::UnsupportedFormat {
+                reason: format!("config.json's scoring_func '{other}' is not supported"),
+            });
+        }
+    };
+    let grouped = |score| -> Result<Option<ExpertGroups>, ProductionIngestionError> {
+        let count = raw.n_group.ok_or_else(|| {
+            malformed("config.json's group-limited routing has no 'n_group'".into())
+        })?;
+        let per_token = raw.topk_group.ok_or_else(|| {
+            malformed("config.json's group-limited routing has no 'topk_group'".into())
+        })?;
+        Ok(Some(ExpertGroups {
+            count,
+            per_token,
+            score,
+        }))
+    };
+    let (groups, selection_bias) = match raw.topk_method.as_deref() {
+        None | Some("greedy") => (None, false),
+        Some("group_limited_greedy") => (grouped(ExpertGroupScore::Max)?, false),
+        Some("noaux_tc") => (grouped(ExpertGroupScore::TopTwoSum)?, true),
+        Some(other) => {
+            return Err(ProductionIngestionError::UnsupportedFormat {
+                reason: format!("config.json's topk_method '{other}' is not supported"),
+            });
+        }
+    };
+    let routing = ExpertRoutingConfig {
+        scoring,
+        groups,
+        routed_scaling_factor: raw.routed_scaling_factor.unwrap_or(1.0),
+        selection_bias,
+        shared_expert_gated: false,
+    };
+    Ok(Some((moe, moe_layers, routing)))
 }
 
 /// `eos_token_id` is a single integer for most Hugging Face configs but a
@@ -477,9 +682,19 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
         });
     }
 
-    let head_dim = match raw.head_dim {
-        Some(declared) => declared,
-        None => {
+    // Latent attention's query/key heads are its non-rotated and rotated
+    // parts together, one K/V head per attention head
+    // (`transformers` sets `head_dim` to the rotated width for its RoPE).
+    let latent = latent_attention(&raw)?;
+    let num_key_value_heads = if latent.is_some() {
+        num_attention_heads
+    } else {
+        num_key_value_heads
+    };
+    let head_dim = match (latent, raw.head_dim) {
+        (Some(mla), _) => mla.qk_nope_head_dim + mla.qk_rope_head_dim,
+        (None, Some(declared)) => declared,
+        (None, None) => {
             if !hidden_size.is_multiple_of(u64::from(num_attention_heads)) {
                 return Err(ProductionIngestionError::MalformedMetadata {
                     reason: format!(
@@ -515,7 +730,26 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
         });
     }
 
-    let (rope_scaling_factor, rope_frequency_scaling) = rope_scaling(raw.rope_scaling.as_ref())?;
+    // `rope_scaling`, else a flat `rope_parameters` naming a scheme (newer
+    // `transformers` releases moved it there).
+    let flat_rope_scaling: Option<RawRopeScaling> = match (&raw.rope_scaling, &raw.rope_parameters)
+    {
+        (None, Some(value)) if value.get("rope_type").is_some() => {
+            Some(serde_json::from_value(value.clone()).map_err(|error| {
+                ProductionIngestionError::MalformedMetadata {
+                    reason: format!("config.json's rope_parameters is malformed: {error}"),
+                }
+            })?)
+        }
+        _ => None,
+    };
+    let (rope_scaling_factor, rope_frequency_scaling) =
+        rope_scaling(raw.rope_scaling.as_ref().or(flat_rope_scaling.as_ref()))?;
+    let routed = routed_experts(&raw, num_hidden_layers)?;
+    let (mixture_of_experts, moe_layers, expert_routing) = match routed {
+        Some((moe, layers, routing)) => (Some(moe), layers, Some(routing)),
+        None => (mixture_of_experts(&raw)?, None, None),
+    };
     let architecture_config = ModelArchitectureConfig {
         hidden_size,
         intermediate_size,
@@ -536,17 +770,15 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
         // `self_attn.{q,k,v}_proj` bias tensors, the only real evidence
         // this ever needs.
         attention_bias: false,
-        mixture_of_experts: mixture_of_experts(&raw)?,
+        mixture_of_experts,
         bos_token_id: raw.bos_token_id,
         eos_token_id: raw.eos_token_id.as_ref().and_then(RawEosTokenId::first),
         layer_layout: layered.and_then(|layered| layered.layout),
         final_logit_softcapping: raw.final_logit_softcapping,
         per_layer_input_size: raw.hidden_size_per_layer_input.filter(|size| *size > 0),
-        // `model-config` 1.7.0: latent attention, mixed expert layers and
-        // expert routing are not read from `config.json` yet.
-        latent_attention: None,
-        moe_layers: None,
-        expert_routing: None,
+        latent_attention: latent,
+        moe_layers,
+        expert_routing,
     };
     architecture_config.validate().map_err(|error| {
         ProductionIngestionError::MalformedMetadata {
@@ -705,10 +937,18 @@ mod tests {
             parse(&serde_json::to_vec(&incomplete).unwrap()).unwrap_err(),
             ProductionIngestionError::MalformedMetadata { .. }
         ));
+        // YaRN without its original context length is incomplete
+        // (`express-latent-attention-forms` reads YaRN).
         let mut yarn = llama3_2_1b_config();
         yarn["rope_scaling"] = serde_json::json!({"rope_type": "yarn", "factor": 4.0});
         assert!(matches!(
             parse(&serde_json::to_vec(&yarn).unwrap()).unwrap_err(),
+            ProductionIngestionError::MalformedMetadata { .. }
+        ));
+        let mut unknown = llama3_2_1b_config();
+        unknown["rope_scaling"] = serde_json::json!({"rope_type": "longrope", "factor": 4.0});
+        assert!(matches!(
+            parse(&serde_json::to_vec(&unknown).unwrap()).unwrap_err(),
             ProductionIngestionError::UnsupportedFormat { .. }
         ));
         let mut default = llama3_2_1b_config();
@@ -1071,5 +1311,181 @@ mod layered_tests {
         );
         assert_eq!(parsed.architecture_config.hidden_size, 5376);
         assert!(parsed.architecture_config.tie_word_embeddings);
+    }
+}
+
+/// `express-latent-attention-forms`: DeepSeek's published `config.json`s and
+/// a `transformers` 5.23 export, read into latent attention, mixed expert
+/// layers, routing and YaRN.
+#[cfg(test)]
+mod latent_attention_tests {
+    use super::*;
+
+    fn parse_deepseek(name: &str) -> NormalizedHfConfig {
+        let path = format!(
+            "{}/testdata/deepseek/{name}.config.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        parse(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    fn yarn(config: &ModelArchitectureConfig) -> (RopeYarnFrequencyScaling, Option<f64>) {
+        match config.rope_frequency_scaling {
+            Some(RopeFrequencyScaling::Yarn {
+                scaling,
+                mscale_all_dim,
+            }) => (scaling, mscale_all_dim),
+            other => panic!("expected YaRN, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deepseek_v2_lite_has_latent_attention_a_dense_first_layer_and_greedy_routing() {
+        let parsed = parse_deepseek("DeepSeek-V2-Lite");
+        assert_eq!(parsed.metadata.model_type, "deepseek_v2");
+        let config = parsed.architecture_config;
+        assert_eq!(
+            config.latent_attention,
+            Some(LatentAttentionConfig {
+                q_lora_rank: None,
+                kv_lora_rank: 512,
+                qk_nope_head_dim: 128,
+                qk_rope_head_dim: 64,
+                v_head_dim: 128,
+            })
+        );
+        assert_eq!(config.head_dim, 192);
+        assert_eq!(config.num_key_value_heads, config.num_attention_heads);
+        assert_eq!(config.intermediate_size, 10944);
+        assert_eq!(
+            config.mixture_of_experts,
+            Some(MixtureOfExpertsConfig {
+                experts: 64,
+                experts_per_token: 6,
+                expert_intermediate_size: 1408,
+                shared_expert_intermediate_size: Some(2 * 1408),
+                normalize_top_k: false,
+            })
+        );
+        let layers = config.moe_layers.as_ref().unwrap();
+        assert_eq!(layers.len(), 27);
+        assert!(!layers[0] && layers[1..].iter().all(|routed| *routed));
+        assert_eq!(
+            config.expert_routing,
+            Some(ExpertRoutingConfig {
+                scoring: ExpertScoring::Softmax,
+                groups: None,
+                routed_scaling_factor: 1.0,
+                selection_bias: false,
+                shared_expert_gated: false,
+            })
+        );
+        let (scaling, mscale_all_dim) = yarn(&config);
+        assert_eq!(scaling.factor, 40.0);
+        assert_eq!(scaling.original_context_length, 4096);
+        assert_eq!((scaling.beta_fast, scaling.beta_slow), (32.0, 1.0));
+        assert!(scaling.truncate);
+        // mscale and mscale_all_dim are equal: cos and sin are unscaled.
+        assert_eq!(scaling.attention_factor, 1.0);
+        assert_eq!(mscale_all_dim, Some(0.707));
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn deepseek_v2_routes_within_groups_and_scales_the_weights() {
+        let config = parse_deepseek("DeepSeek-V2").architecture_config;
+        assert_eq!(config.latent_attention.unwrap().q_lora_rank, Some(1536));
+        assert_eq!(
+            config.expert_routing,
+            Some(ExpertRoutingConfig {
+                scoring: ExpertScoring::Softmax,
+                groups: Some(ExpertGroups {
+                    count: 8,
+                    per_token: 3,
+                    score: ExpertGroupScore::Max,
+                }),
+                routed_scaling_factor: 16.0,
+                selection_bias: false,
+                shared_expert_gated: false,
+            })
+        );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn deepseek_v3_scores_with_a_sigmoid_and_a_selection_bias() {
+        let parsed = parse_deepseek("DeepSeek-V3");
+        assert_eq!(parsed.metadata.model_type, "deepseek_v3");
+        let config = parsed.architecture_config;
+        let layers = config.moe_layers.as_ref().unwrap();
+        assert!(
+            layers[..3].iter().all(|routed| !routed) && layers[3..].iter().all(|routed| *routed)
+        );
+        let moe = config.mixture_of_experts.unwrap();
+        assert!(moe.normalize_top_k);
+        assert_eq!(
+            moe.shared_expert_intermediate_size,
+            Some(moe.expert_intermediate_size)
+        );
+        assert_eq!(
+            config.expert_routing,
+            Some(ExpertRoutingConfig {
+                scoring: ExpertScoring::Sigmoid,
+                groups: Some(ExpertGroups {
+                    count: 8,
+                    per_token: 4,
+                    score: ExpertGroupScore::TopTwoSum,
+                }),
+                routed_scaling_factor: 2.5,
+                selection_bias: true,
+                shared_expert_gated: false,
+            })
+        );
+        config.validate().unwrap();
+    }
+
+    /// `transformers` 5 writes RoPE (YaRN included) under a flat
+    /// `rope_parameters` and `head_dim` as the rotated width; both are read.
+    #[test]
+    fn a_transformers_5_export_reads_yarn_from_rope_parameters() {
+        let config = parse_deepseek("tiny-deepseek-v2").architecture_config;
+        let mla = config.latent_attention.unwrap();
+        assert_eq!(config.head_dim, mla.qk_nope_head_dim + mla.qk_rope_head_dim);
+        assert_eq!(config.rope_theta, 100.0);
+        let (scaling, mscale_all_dim) = yarn(&config);
+        assert_eq!(scaling.factor, 4.0);
+        assert_eq!((scaling.beta_fast, scaling.beta_slow), (2.0, 1.0));
+        assert_eq!(scaling.attention_factor, 1.0);
+        assert_eq!(mscale_all_dim, Some(0.8));
+        config.validate().unwrap();
+    }
+
+    /// A YaRN `attention_factor` is taken as declared, else derived from the
+    /// factor alone when the two mscales are not both declared.
+    #[test]
+    fn yarn_attention_factor_follows_transformers() {
+        let parsed = |rope: &str| {
+            let json = format!(
+                r#"{{"model_type": "qwen2", "hidden_size": 8, "intermediate_size": 16,
+                    "num_hidden_layers": 1, "num_attention_heads": 2, "vocab_size": 32,
+                    "rope_scaling": {rope}}}"#
+            );
+            yarn(&parse(json.as_bytes()).unwrap().architecture_config).0
+        };
+        let factor_only =
+            parsed(r#"{"type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768}"#);
+        assert!((factor_only.attention_factor - (0.1 * 4f64.ln() + 1.0)).abs() < 1e-12);
+        let declared = parsed(
+            r#"{"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768,
+                "attention_factor": 1.5, "truncate": false}"#,
+        );
+        assert_eq!(declared.attention_factor, 1.5);
+        assert!(!declared.truncate);
+        let missing = parse(
+            br#"{"model_type": "qwen2", "hidden_size": 8, "intermediate_size": 16,
+                "num_hidden_layers": 1, "num_attention_heads": 2, "vocab_size": 32,
+                "rope_scaling": {"type": "yarn", "factor": 4.0}}"#,
+        );
+        assert!(missing.is_err());
     }
 }

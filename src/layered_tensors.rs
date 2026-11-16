@@ -17,6 +17,19 @@
 //!   input columns becomes `moe.router_proj`, in `f32`: the router computes
 //!   `proj(norm(x) * scale * hidden^-0.5)`, and this fold is exact for a
 //!   float projection.
+//! - A latent-attention layer's fused projections are split by rows
+//!   (`express-latent-attention-forms`): the query projection (`q_proj`, or
+//!   `q_b_proj` after a low-rank query) stores each head's
+//!   position-independent rows before its rotated rows, and becomes
+//!   `self_attn.q_nope_proj` and `self_attn.q_rope_proj`;
+//!   `kv_a_proj_with_mqa` stores the latent's rows before the shared
+//!   rotated key's, and becomes `self_attn.kv_a_proj` and
+//!   `self_attn.k_rope_proj`; `kv_b_proj` stores each head's key rows
+//!   before its value rows, and becomes `self_attn.k_nope_proj` and
+//!   `self_attn.v_proj`. Row splits copy bytes, so they are exact.
+//! - Routed experts stored one by one (`mlp.experts.E.{gate,up,down}_proj`)
+//!   are stacked in expert order into `moe.experts_{gate,up,down}_proj`, the
+//!   same layout as the restacked `experts.gate_up_proj` above.
 //!
 //! The derived tensors keep `nn.Linear`'s `[out, in]` orientation, so
 //! `weight_layout.rs` transposes them like every stored projection. No
@@ -40,6 +53,15 @@ pub(crate) const EXPERTS_GATE_UP: &str = "packed.experts_gate_up";
 pub(crate) const ROUTER_PROJECTION: &str = "packed.router_proj";
 /// A layer's `router.scale`, as discovered (after `layers.N.`).
 pub(crate) const ROUTER_SCALE: &str = "packed.router_scale";
+/// A latent-attention layer's `q_b_proj`, as discovered (after `layers.N.`).
+pub(crate) const QUERY_UP_PROJECTION: &str = "packed.q_b_proj";
+/// A latent-attention layer's `kv_a_proj_with_mqa`, as discovered.
+pub(crate) const LATENT_DOWN_PROJECTION: &str = "packed.kv_a_proj_with_mqa";
+/// A latent-attention layer's `kv_b_proj`, as discovered.
+pub(crate) const LATENT_UP_PROJECTION: &str = "packed.kv_b_proj";
+/// One routed expert's projection, as discovered: `layers.N.` then this
+/// prefix, the expert's index and `.{gate,up,down}_proj`.
+pub(crate) const EXPERT_PREFIX: &str = "packed.experts.";
 
 /// How one derived tensor's bytes come from a stored one.
 #[derive(Debug)]
@@ -57,6 +79,8 @@ enum Derivation {
         source: String,
         ranges: Vec<(u64, u64)>,
     },
+    /// These whole tensors, concatenated.
+    Stack { sources: Vec<String> },
     /// The `[experts, hidden]` router projection with `scale[h] * factor`
     /// folded into its column `h`, as `f32`.
     Router {
@@ -375,6 +399,8 @@ pub fn derive(
             size,
         ));
     }
+    derive_latent_attention(tensors, config, &mut derived, &mut added)?;
+    stack_experts(tensors, config, &mut derived, &mut added)?;
     if let Some(stray) = tensors
         .iter()
         .find(|tensor| tensor.name.contains("packed."))
@@ -386,6 +412,269 @@ pub fn derive(
     }
     tensors.extend(added);
     Ok(LayeredTensorSource { inner, derived })
+}
+
+/// `rows` of `stored`, by `(first row, row count)`, as the derived tensor
+/// `layers.{layer}.{name}`: a `[rows, in]` matrix of `stored`'s bytes.
+fn insert_rows(
+    derived: &mut BTreeMap<String, (Derivation, u64)>,
+    added: &mut Vec<ModelTensorMetadata>,
+    stored: &ModelTensorMetadata,
+    layer: &str,
+    name: &str,
+    rows: &[(u64, u64)],
+) -> Result<(), ProductionIngestionError> {
+    let columns = stored.shape[1];
+    let row_bytes = columns * element_bytes(stored)?;
+    let count: u64 = rows.iter().map(|(_, count)| count).sum();
+    let name = format!("layers.{layer}.{name}");
+    let size = count * row_bytes;
+    derived.insert(
+        name.clone(),
+        (
+            Derivation::Ranges {
+                source: stored.name.clone(),
+                ranges: rows
+                    .iter()
+                    .map(|(first, count)| (first * row_bytes, count * row_bytes))
+                    .collect(),
+            },
+            size,
+        ),
+    );
+    added.push(derived_tensor(
+        stored,
+        name,
+        vec![count, columns],
+        stored.storage_dtype,
+        size,
+    ));
+    Ok(())
+}
+
+/// Each head's `first` rows then its `second` rows, for `heads` heads: the
+/// `(first row, row count)` runs of either part.
+fn per_head_rows(heads: u64, first: u64, second: u64) -> [Vec<(u64, u64)>; 2] {
+    let stride = first + second;
+    [
+        (0..heads).map(|head| (head * stride, first)).collect(),
+        (0..heads)
+            .map(|head| (head * stride + first, second))
+            .collect(),
+    ]
+}
+
+/// Takes `layers.{layer}.{suffix}`, checked to be a `[rows, columns]`
+/// matrix.
+fn take_matrix(
+    tensors: &mut Vec<ModelTensorMetadata>,
+    layer: &str,
+    suffix: &str,
+    rows: u64,
+    columns: u64,
+) -> Result<ModelTensorMetadata, ProductionIngestionError> {
+    let name = format!("layers.{layer}.{suffix}");
+    let stored = take(tensors, &name)
+        .ok_or_else(|| malformed(format!("latent-attention layer {layer} has no '{name}'")))?;
+    if stored.shape != [rows, columns] {
+        return Err(malformed(format!(
+            "'{name}' is {:?}, not [{rows}, {columns}]",
+            stored.shape
+        )));
+    }
+    Ok(stored)
+}
+
+/// Splits each latent-attention layer's fused projections by rows (see the
+/// module documentation).
+fn derive_latent_attention(
+    tensors: &mut Vec<ModelTensorMetadata>,
+    config: &ModelArchitectureConfig,
+    derived: &mut BTreeMap<String, (Derivation, u64)>,
+    added: &mut Vec<ModelTensorMetadata>,
+) -> Result<(), ProductionIngestionError> {
+    let latent_layers = layers_with(tensors, LATENT_DOWN_PROJECTION);
+    let Some(mla) = &config.latent_attention else {
+        if let Some(layer) = latent_layers.first() {
+            return Err(malformed(format!(
+                "layer {layer} stores latent-attention projections, but config.json \
+                 declares no kv_lora_rank"
+            )));
+        }
+        return Ok(());
+    };
+    let heads = u64::from(config.num_attention_heads);
+    let (nope, rope, value) = (mla.qk_nope_head_dim, mla.qk_rope_head_dim, mla.v_head_dim);
+    let latent = u64::from(mla.kv_lora_rank);
+    let hidden = config.hidden_size;
+    for layer in 0..u64::from(config.num_hidden_layers) {
+        let layer = layer.to_string();
+        let (query_name, query_input) = match mla.q_lora_rank {
+            Some(rank) => (QUERY_UP_PROJECTION, u64::from(rank)),
+            None => ("self_attn.q_proj", hidden),
+        };
+        let query = take_matrix(
+            tensors,
+            &layer,
+            query_name,
+            heads * (nope + rope),
+            query_input,
+        )?;
+        let [query_nope, query_rope] = per_head_rows(heads, nope, rope);
+        insert_rows(
+            derived,
+            added,
+            &query,
+            &layer,
+            "self_attn.q_nope_proj",
+            &query_nope,
+        )?;
+        insert_rows(
+            derived,
+            added,
+            &query,
+            &layer,
+            "self_attn.q_rope_proj",
+            &query_rope,
+        )?;
+
+        let down = take_matrix(
+            tensors,
+            &layer,
+            LATENT_DOWN_PROJECTION,
+            latent + rope,
+            hidden,
+        )?;
+        insert_rows(
+            derived,
+            added,
+            &down,
+            &layer,
+            "self_attn.kv_a_proj",
+            &[(0, latent)],
+        )?;
+        insert_rows(
+            derived,
+            added,
+            &down,
+            &layer,
+            "self_attn.k_rope_proj",
+            &[(latent, rope)],
+        )?;
+
+        let up = take_matrix(
+            tensors,
+            &layer,
+            LATENT_UP_PROJECTION,
+            heads * (nope + value),
+            latent,
+        )?;
+        let [key_nope, values] = per_head_rows(heads, nope, value);
+        insert_rows(
+            derived,
+            added,
+            &up,
+            &layer,
+            "self_attn.k_nope_proj",
+            &key_nope,
+        )?;
+        insert_rows(derived, added, &up, &layer, "self_attn.v_proj", &values)?;
+    }
+    Ok(())
+}
+
+/// Stacks each layer's routed experts, stored one by one, in expert order
+/// (see the module documentation).
+fn stack_experts(
+    tensors: &mut Vec<ModelTensorMetadata>,
+    config: &ModelArchitectureConfig,
+    derived: &mut BTreeMap<String, (Derivation, u64)>,
+    added: &mut Vec<ModelTensorMetadata>,
+) -> Result<(), ProductionIngestionError> {
+    // (layer, projection) -> expert -> stored tensor.
+    let mut stored: BTreeMap<(String, String), BTreeMap<u64, ModelTensorMetadata>> =
+        BTreeMap::new();
+    let mut index = 0;
+    while index < tensors.len() {
+        let parsed = tensors[index]
+            .name
+            .strip_prefix("layers.")
+            .and_then(|rest| rest.split_once('.'))
+            .and_then(|(layer, rest)| Some((layer, rest.strip_prefix(EXPERT_PREFIX)?)))
+            .and_then(|(layer, rest)| {
+                let (expert, projection) = rest.split_once('.')?;
+                Some((
+                    layer.to_string(),
+                    expert.parse::<u64>().ok()?,
+                    projection.to_string(),
+                ))
+            });
+        let Some((layer, expert, projection)) = parsed else {
+            index += 1;
+            continue;
+        };
+        let tensor = tensors.remove(index);
+        stored
+            .entry((layer, projection))
+            .or_default()
+            .insert(expert, tensor);
+    }
+    if stored.is_empty() {
+        return Ok(());
+    }
+    let moe = config.mixture_of_experts.as_ref().ok_or_else(|| {
+        malformed(
+            "the bundle stores routed experts, but config.json declares no mixture of experts"
+                .into(),
+        )
+    })?;
+    let experts = u64::from(moe.experts);
+    let intermediate = moe.expert_intermediate_size;
+    let hidden = config.hidden_size;
+    for ((layer, projection), by_expert) in stored {
+        let shape = match projection.as_str() {
+            "gate_proj" | "up_proj" => [intermediate, hidden],
+            _ => [hidden, intermediate],
+        };
+        if by_expert.keys().copied().ne(0..experts) {
+            return Err(malformed(format!(
+                "layer {layer} stores the {projection} of experts {:?}, not of experts 0 to {}",
+                by_expert.keys().collect::<Vec<_>>(),
+                experts - 1
+            )));
+        }
+        let first = &by_expert[&0];
+        for tensor in by_expert.values() {
+            if tensor.shape != shape || tensor.storage_dtype != first.storage_dtype {
+                return Err(malformed(format!(
+                    "'{}' is {:?} {:?}, not {:?} {shape:?} like the layer's other experts",
+                    tensor.name, tensor.storage_dtype, tensor.shape, first.storage_dtype
+                )));
+            }
+        }
+        let size = experts * shape[0] * shape[1] * element_bytes(first)?;
+        let name = format!("layers.{layer}.moe.experts_{projection}");
+        derived.insert(
+            name.clone(),
+            (
+                Derivation::Stack {
+                    sources: by_expert
+                        .values()
+                        .map(|tensor| tensor.name.clone())
+                        .collect(),
+                },
+                size,
+            ),
+        );
+        added.push(derived_tensor(
+            first,
+            name,
+            vec![experts * shape[0], shape[1]],
+            first.storage_dtype,
+            size,
+        ));
+    }
+    Ok(())
 }
 
 impl ProductionArtifactPayloadSource for LayeredTensorSource {
@@ -416,6 +705,12 @@ impl ProductionArtifactPayloadSource for LayeredTensorSource {
             Derivation::Ranges { source, ranges } => {
                 for (offset, length) in ranges {
                     bytes.extend(plain.read_within(source, *offset, *length)?);
+                }
+            }
+            Derivation::Stack { sources } => {
+                for source in sources {
+                    let total = plain.tensor_length(source)?;
+                    bytes.extend(plain.read_within(source, 0, total)?);
                 }
             }
             Derivation::Router {
