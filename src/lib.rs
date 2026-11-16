@@ -1409,4 +1409,122 @@ mod tests {
         assert_eq!(shapes, expected);
         assert_eq!(config.moe_layers, Some(vec![false, true, true]));
     }
+
+    /// A latent-attention bundle whose fused query projection is
+    /// BitsAndBytes-quantized: its stored bytes are packed NF4, not the
+    /// values the row split would cut, so ingestion refuses it instead of
+    /// splitting packed bytes.
+    #[test]
+    fn a_quantized_projection_is_not_split_by_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: serde_json::Value = serde_json::from_slice(&qwen2_config_bytes()).unwrap();
+        for (key, value) in [
+            ("model_type", serde_json::json!("deepseek_v2")),
+            ("hidden_size", serde_json::json!(8)),
+            ("intermediate_size", serde_json::json!(8)),
+            ("num_attention_heads", serde_json::json!(1)),
+            ("num_key_value_heads", serde_json::json!(1)),
+            ("vocab_size", serde_json::json!(4)),
+            ("tie_word_embeddings", serde_json::json!(false)),
+            ("kv_lora_rank", serde_json::json!(2)),
+            ("qk_nope_head_dim", serde_json::json!(4)),
+            ("qk_rope_head_dim", serde_json::json!(4)),
+            ("v_head_dim", serde_json::json!(6)),
+        ] {
+            config[key] = value;
+        }
+        fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+
+        let mut header = serde_json::Map::new();
+        let mut data = Vec::new();
+        let mut push = |name: &str, dtype: &str, shape: Vec<u64>, bytes: &[u8]| {
+            let start = data.len() as u64;
+            data.extend_from_slice(bytes);
+            header.insert(
+                name.to_string(),
+                serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [start, data.len()]}),
+            );
+        };
+        push(
+            "model.embed_tokens.weight",
+            "F32",
+            vec![4, 8],
+            &[0u8; 4 * 8 * 4],
+        );
+        push("model.norm.weight", "F32", vec![8], &[0u8; 8 * 4]);
+        push(
+            "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
+            "F32",
+            vec![6, 8],
+            &[0u8; 6 * 8 * 4],
+        );
+        push(
+            "model.layers.0.self_attn.kv_b_proj.weight",
+            "F32",
+            vec![10, 2],
+            &[0u8; 10 * 2 * 4],
+        );
+        // `q_proj` (`[1 * (4 + 4), 8]`) in NF4, as `ingests_a_bnb_quantized_bundle_end_to_end`
+        // stores its projection.
+        let prefix = "model.layers.0.self_attn.q_proj.weight";
+        push(prefix, "U8", vec![32, 1], &[0x77u8; 32]);
+        push(&format!("{prefix}.absmax"), "U8", vec![1], &[42u8]);
+        let quant_map: Vec<u8> = (0..16u32).flat_map(|v| (v as f32).to_le_bytes()).collect();
+        push(&format!("{prefix}.quant_map"), "F32", vec![16], &quant_map);
+        push(
+            &format!("{prefix}.nested_absmax"),
+            "F32",
+            vec![1],
+            &2.0f32.to_le_bytes(),
+        );
+        push(
+            &format!("{prefix}.nested_quant_map"),
+            "F32",
+            vec![256],
+            &[0u8; 256 * 4],
+        );
+        let quant_state = serde_json::json!({
+            "quant_type": "nf4",
+            "blocksize": 64,
+            "dtype": "bfloat16",
+            "shape": [8, 8],
+            "nested_blocksize": 1,
+            "nested_dtype": "float32",
+            "nested_offset": 0.5
+        })
+        .to_string()
+        .into_bytes();
+        push(
+            &format!("{prefix}.quant_state.bitsandbytes__nf4"),
+            "U8",
+            vec![quant_state.len() as u64],
+            &quant_state,
+        );
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut file = fs::File::create(dir.path().join("model.safetensors")).unwrap();
+        file.write_all(&(header_bytes.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header_bytes).unwrap();
+        file.write_all(&data).unwrap();
+        drop(file);
+
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        match HuggingFaceIngestor::new().ingest(&source) {
+            Err(ProductionIngestionError::UnsupportedFormat { reason }) => {
+                assert!(
+                    reason.contains("layers.0.self_attn.q_proj") && reason.contains("quantized"),
+                    "{reason}"
+                );
+            }
+            Err(other) => panic!("expected UnsupportedFormat, got {other:?}"),
+            Ok(_) => panic!("a quantized projection was split by rows"),
+        }
+    }
 }

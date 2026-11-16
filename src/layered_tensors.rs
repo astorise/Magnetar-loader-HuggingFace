@@ -401,6 +401,30 @@ pub fn derive(
     }
     derive_latent_attention(tensors, config, &mut derived, &mut added)?;
     stack_experts(tensors, config, &mut derived, &mut added)?;
+    // Every derivation reads its sources' stored bytes. A GPTQ, AWQ or
+    // BitsAndBytes projection's stored bytes are not its values (they are
+    // dequantized on read, GPTQ's and AWQ's already transposed), so
+    // deriving from one is refused rather than cut from packed bytes.
+    for (name, (derivation, _)) in &derived {
+        let sources: Vec<&String> = match derivation {
+            Derivation::Columns { source, .. } | Derivation::Ranges { source, .. } => {
+                vec![source]
+            }
+            Derivation::Stack { sources } => sources.iter().collect(),
+            Derivation::Router {
+                projection, scale, ..
+            } => vec![projection, scale],
+        };
+        if let Some(source) = sources.into_iter().find(|source| inner.dequantizes(source)) {
+            return Err(ProductionIngestionError::UnsupportedFormat {
+                reason: format!(
+                    "'{name}' would be derived from '{source}', a quantized projection; \
+                     splitting or stacking GPTQ, AWQ or BitsAndBytes projections is not \
+                     supported"
+                ),
+            });
+        }
+    }
     if let Some(stray) = tensors
         .iter()
         .find(|tensor| tensor.name.contains("packed."))

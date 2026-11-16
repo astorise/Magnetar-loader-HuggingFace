@@ -273,6 +273,17 @@ impl WeightsPayloadSource {
             Self::Bnb(source) => source.inner(),
         }
     }
+
+    /// Whether `identity` is a quantized projection, whose stored bytes are
+    /// not its values: it is dequantized on read.
+    pub(crate) fn dequantizes(&self, identity: &str) -> bool {
+        match self {
+            Self::Plain(_) => false,
+            Self::Gptq(source) => source.dequantizes(identity),
+            Self::Awq(source) => source.dequantizes(identity),
+            Self::Bnb(source) => source.dequantizes(identity),
+        }
+    }
 }
 
 impl ProductionArtifactPayloadSource for WeightsPayloadSource {
