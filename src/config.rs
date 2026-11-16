@@ -542,6 +542,11 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
         layer_layout: layered.and_then(|layered| layered.layout),
         final_logit_softcapping: raw.final_logit_softcapping,
         per_layer_input_size: raw.hidden_size_per_layer_input.filter(|size| *size > 0),
+        // `model-config` 1.7.0: latent attention, mixed expert layers and
+        // expert routing are not read from `config.json` yet.
+        latent_attention: None,
+        moe_layers: None,
+        expert_routing: None,
     };
     architecture_config.validate().map_err(|error| {
         ProductionIngestionError::MalformedMetadata {
