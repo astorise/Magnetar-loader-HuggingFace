@@ -54,6 +54,9 @@ pub fn is_non_text_tensor(raw: &str) -> bool {
 ///   `layer_scalar` and per-layer input weights. Tables packing every
 ///   layer's weights and routed experts take internal names that
 ///   `layered_tensors.rs` replaces with the per-layer and stacked tensors.
+/// - a latent-attention layer's fused projections and each routed
+///   expert's own projections take internal names too: `layered_tensors.rs`
+///   splits the former by rows and stacks the latter.
 pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionError> {
     // A multimodal bundle nests its text decoder under `language_model`.
     let unnested;
@@ -85,6 +88,8 @@ pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionErr
             "experts.down_proj" => Some("moe.experts_down_proj"),
             "router.scale" => Some(crate::layered_tensors::ROUTER_SCALE),
             "router.per_expert_scale" => Some("moe.per_expert_scale"),
+            // A sigmoid router's selection-only bias per expert.
+            "mlp.gate.e_score_correction_bias" => Some("moe.selection_bias"),
             _ => None,
         };
         if let Some(canonical) = canonical {
@@ -150,6 +155,19 @@ pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionErr
             .map_err(|_| ProductionIngestionError::MalformedMetadata {
                 reason: format!("tensor '{raw}' has a non-numeric layer index '{layer_index}'"),
             })?;
+        // One routed expert's own projection; `layered_tensors.rs` stacks
+        // a layer's experts in expert order.
+        if let Some((expert, projection)) = rest
+            .strip_prefix("mlp.experts.")
+            .and_then(|expert| expert.split_once('.'))
+            && expert.parse::<u64>().is_ok()
+            && matches!(projection, "gate_proj" | "up_proj" | "down_proj")
+        {
+            return Ok(format!(
+                "layers.{layer_index}.{}{expert}.{projection}",
+                crate::layered_tensors::EXPERT_PREFIX
+            ));
+        }
         let canonical_suffix = match rest {
             "input_layernorm" => "input_norm",
             "post_attention_layernorm" => "post_attn_norm",
@@ -172,6 +190,20 @@ pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionErr
             "per_layer_projection" => "per_layer_projection",
             "post_per_layer_input_norm" => "post_per_layer_input_norm",
             "router.proj" => crate::layered_tensors::ROUTER_PROJECTION,
+            // Latent attention (`express-latent-attention-forms`): the
+            // fused projections take internal names that
+            // `layered_tensors.rs` splits by rows.
+            "self_attn.q_a_proj" => "self_attn.q_a_proj",
+            "self_attn.q_a_layernorm" => "self_attn.q_a_norm",
+            "self_attn.q_b_proj" => crate::layered_tensors::QUERY_UP_PROJECTION,
+            "self_attn.kv_a_proj_with_mqa" => crate::layered_tensors::LATENT_DOWN_PROJECTION,
+            "self_attn.kv_a_layernorm" => "self_attn.kv_a_norm",
+            "self_attn.kv_b_proj" => crate::layered_tensors::LATENT_UP_PROJECTION,
+            // An unscaled router and ungated shared experts.
+            "mlp.gate" => "moe.router_proj",
+            "mlp.shared_experts.gate_proj" => "moe.shared_gate_proj",
+            "mlp.shared_experts.up_proj" => "moe.shared_up_proj",
+            "mlp.shared_experts.down_proj" => "moe.shared_down_proj",
             other => {
                 return Err(ProductionIngestionError::MalformedMetadata {
                     reason: format!(
@@ -372,5 +404,60 @@ mod layered_tests {
         for (raw, canonical) in cases {
             assert_eq!(normalize_tensor_name(raw).unwrap(), canonical, "{raw}");
         }
+    }
+
+    /// A latent-attention decoder's fused projections, per-expert weights,
+    /// router and shared experts.
+    #[test]
+    fn latent_attention_and_per_expert_tensors_take_their_names() {
+        let cases = [
+            (
+                "model.layers.2.self_attn.q_a_proj.weight",
+                "layers.2.self_attn.q_a_proj",
+            ),
+            (
+                "model.layers.2.self_attn.q_a_layernorm.weight",
+                "layers.2.self_attn.q_a_norm",
+            ),
+            (
+                "model.layers.2.self_attn.q_b_proj.weight",
+                "layers.2.packed.q_b_proj",
+            ),
+            (
+                "model.layers.2.self_attn.kv_a_proj_with_mqa.weight",
+                "layers.2.packed.kv_a_proj_with_mqa",
+            ),
+            (
+                "model.layers.2.self_attn.kv_a_layernorm.weight",
+                "layers.2.self_attn.kv_a_norm",
+            ),
+            (
+                "model.layers.2.self_attn.kv_b_proj.weight",
+                "layers.2.packed.kv_b_proj",
+            ),
+            ("model.layers.2.mlp.gate.weight", "layers.2.moe.router_proj"),
+            (
+                "model.layers.2.mlp.gate.e_score_correction_bias",
+                "layers.2.moe.selection_bias",
+            ),
+            (
+                "model.layers.2.mlp.experts.17.down_proj.weight",
+                "layers.2.packed.experts.17.down_proj",
+            ),
+            (
+                "model.layers.2.mlp.shared_experts.up_proj.weight",
+                "layers.2.moe.shared_up_proj",
+            ),
+            // A dense layer's MLP keeps its names.
+            (
+                "model.layers.0.mlp.gate_proj.weight",
+                "layers.0.mlp.gate_proj",
+            ),
+        ];
+        for (raw, canonical) in cases {
+            assert_eq!(normalize_tensor_name(raw).unwrap(), canonical, "{raw}");
+        }
+        assert!(normalize_tensor_name("model.layers.2.mlp.experts.x.up_proj.weight").is_err());
+        assert!(normalize_tensor_name("model.layers.2.mlp.experts.3.fc1.weight").is_err());
     }
 }

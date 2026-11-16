@@ -392,6 +392,11 @@ impl<S> GptqDequantizingPayloadSource<S> {
         &self.inner
     }
 
+    /// Whether `identity` is a projection this source dequantizes on read.
+    pub(crate) fn dequantizes(&self, identity: &str) -> bool {
+        self.projections.contains_key(identity)
+    }
+
     pub fn new(inner: S, projections: Vec<GptqProjection>) -> Self {
         Self {
             inner,

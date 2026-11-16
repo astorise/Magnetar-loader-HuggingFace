@@ -1268,4 +1268,263 @@ mod tests {
             );
         }
     }
+
+    /// The tensor names and shapes `transformers` 5.23 saves for
+    /// `testdata/deepseek/tiny-deepseek-v2.config.json` (a dense first
+    /// layer, then two layers of 4 routed and 2 shared experts, latent
+    /// attention without a low-rank query), each stored as `[out, in]`.
+    fn tiny_latent_attention_tensors() -> Vec<(String, Vec<u64>)> {
+        let mut tensors = vec![
+            ("model.embed_tokens.weight".to_string(), vec![64, 32]),
+            ("model.norm.weight".to_string(), vec![32]),
+            ("lm_head.weight".to_string(), vec![64, 32]),
+        ];
+        for layer in 0..3 {
+            let name = |field: &str| format!("model.layers.{layer}.{field}.weight");
+            for (field, shape) in [
+                ("input_layernorm", vec![32]),
+                ("post_attention_layernorm", vec![32]),
+                ("self_attn.q_proj", vec![20, 32]),
+                ("self_attn.kv_a_proj_with_mqa", vec![16, 32]),
+                ("self_attn.kv_a_layernorm", vec![12]),
+                ("self_attn.kv_b_proj", vec![22, 12]),
+                ("self_attn.o_proj", vec![32, 10]),
+            ] {
+                tensors.push((name(field), shape));
+            }
+            if layer == 0 {
+                tensors.push((name("mlp.gate_proj"), vec![48, 32]));
+                tensors.push((name("mlp.up_proj"), vec![48, 32]));
+                tensors.push((name("mlp.down_proj"), vec![32, 48]));
+                continue;
+            }
+            tensors.push((name("mlp.gate"), vec![4, 32]));
+            for expert in 0..4 {
+                tensors.push((
+                    name(&format!("mlp.experts.{expert}.gate_proj")),
+                    vec![16, 32],
+                ));
+                tensors.push((name(&format!("mlp.experts.{expert}.up_proj")), vec![16, 32]));
+                tensors.push((
+                    name(&format!("mlp.experts.{expert}.down_proj")),
+                    vec![32, 16],
+                ));
+            }
+            tensors.push((name("mlp.shared_experts.gate_proj"), vec![32, 32]));
+            tensors.push((name("mlp.shared_experts.up_proj"), vec![32, 32]));
+            tensors.push((name("mlp.shared_experts.down_proj"), vec![32, 32]));
+        }
+        tensors
+    }
+
+    /// A latent-attention checkpoint ingests into the tensors its Model
+    /// Component requests, each the shape the Runtime expects
+    /// (`express-latent-attention-forms`).
+    #[test]
+    fn ingests_a_latent_attention_bundle_into_the_requested_tensors() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/testdata/deepseek/tiny-deepseek-v2.config.json"
+            ),
+            dir.path().join("config.json"),
+        )
+        .unwrap();
+        let mut header = serde_json::Map::new();
+        let mut data = Vec::new();
+        for (name, shape) in tiny_latent_attention_tensors() {
+            let start = data.len() as u64;
+            data.resize(data.len() + shape.iter().product::<u64>() as usize * 4, 0);
+            header.insert(
+                name,
+                serde_json::json!({
+                    "dtype": "F32",
+                    "shape": shape,
+                    "data_offsets": [start, data.len()],
+                }),
+            );
+        }
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut file = fs::File::create(dir.path().join("model.safetensors")).unwrap();
+        file.write_all(&(header_bytes.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header_bytes).unwrap();
+        file.write_all(&data).unwrap();
+        drop(file);
+
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        let result = HuggingFaceIngestor::new()
+            .ingest(&source)
+            .expect("bundle ingests");
+        let config = result.manifest.architecture_config.clone().unwrap();
+        let mla = config.latent_attention.unwrap();
+        let shapes: BTreeMap<&str, &[u64]> = result
+            .manifest
+            .tensors
+            .iter()
+            .map(|tensor| (tensor.name.as_str(), tensor.shape.as_slice()))
+            .collect();
+
+        let mut expected: BTreeMap<String, Vec<u64>> = BTreeMap::from([
+            ("token_embedding".to_string(), vec![64, 32]),
+            ("final_norm".to_string(), vec![32]),
+            ("lm_head".to_string(), vec![32, 64]),
+        ]);
+        for layer in 0..3 {
+            for (projection, shape) in magnetar_runtime::latent_attention_projection_shapes(
+                32,
+                u64::from(config.num_attention_heads),
+                &mla,
+            ) {
+                expected.insert(format!("layers.{layer}.{projection}"), shape);
+            }
+            expected.insert(format!("layers.{layer}.input_norm"), vec![32]);
+            expected.insert(format!("layers.{layer}.post_attn_norm"), vec![32]);
+            if layer == 0 {
+                expected.insert("layers.0.mlp.gate_proj".into(), vec![32, 48]);
+                expected.insert("layers.0.mlp.up_proj".into(), vec![32, 48]);
+                expected.insert("layers.0.mlp.down_proj".into(), vec![48, 32]);
+                continue;
+            }
+            for (name, shape) in [
+                ("router_proj", vec![32, 4]),
+                ("experts_gate_proj", vec![32, 64]),
+                ("experts_up_proj", vec![32, 64]),
+                ("experts_down_proj", vec![16, 128]),
+                ("shared_gate_proj", vec![32, 32]),
+                ("shared_up_proj", vec![32, 32]),
+                ("shared_down_proj", vec![32, 32]),
+            ] {
+                expected.insert(format!("layers.{layer}.moe.{name}"), shape);
+            }
+        }
+        let expected: BTreeMap<&str, &[u64]> = expected
+            .iter()
+            .map(|(name, shape)| (name.as_str(), shape.as_slice()))
+            .collect();
+        assert_eq!(shapes, expected);
+        assert_eq!(config.moe_layers, Some(vec![false, true, true]));
+    }
+
+    /// A latent-attention bundle whose fused query projection is
+    /// BitsAndBytes-quantized: its stored bytes are packed NF4, not the
+    /// values the row split would cut, so ingestion refuses it instead of
+    /// splitting packed bytes.
+    #[test]
+    fn a_quantized_projection_is_not_split_by_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: serde_json::Value = serde_json::from_slice(&qwen2_config_bytes()).unwrap();
+        for (key, value) in [
+            ("model_type", serde_json::json!("deepseek_v2")),
+            ("hidden_size", serde_json::json!(8)),
+            ("intermediate_size", serde_json::json!(8)),
+            ("num_attention_heads", serde_json::json!(1)),
+            ("num_key_value_heads", serde_json::json!(1)),
+            ("vocab_size", serde_json::json!(4)),
+            ("tie_word_embeddings", serde_json::json!(false)),
+            ("kv_lora_rank", serde_json::json!(2)),
+            ("qk_nope_head_dim", serde_json::json!(4)),
+            ("qk_rope_head_dim", serde_json::json!(4)),
+            ("v_head_dim", serde_json::json!(6)),
+        ] {
+            config[key] = value;
+        }
+        fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+
+        let mut header = serde_json::Map::new();
+        let mut data = Vec::new();
+        let mut push = |name: &str, dtype: &str, shape: Vec<u64>, bytes: &[u8]| {
+            let start = data.len() as u64;
+            data.extend_from_slice(bytes);
+            header.insert(
+                name.to_string(),
+                serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [start, data.len()]}),
+            );
+        };
+        push(
+            "model.embed_tokens.weight",
+            "F32",
+            vec![4, 8],
+            &[0u8; 4 * 8 * 4],
+        );
+        push("model.norm.weight", "F32", vec![8], &[0u8; 8 * 4]);
+        push(
+            "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
+            "F32",
+            vec![6, 8],
+            &[0u8; 6 * 8 * 4],
+        );
+        push(
+            "model.layers.0.self_attn.kv_b_proj.weight",
+            "F32",
+            vec![10, 2],
+            &[0u8; 10 * 2 * 4],
+        );
+        // `q_proj` (`[1 * (4 + 4), 8]`) in NF4, as `ingests_a_bnb_quantized_bundle_end_to_end`
+        // stores its projection.
+        let prefix = "model.layers.0.self_attn.q_proj.weight";
+        push(prefix, "U8", vec![32, 1], &[0x77u8; 32]);
+        push(&format!("{prefix}.absmax"), "U8", vec![1], &[42u8]);
+        let quant_map: Vec<u8> = (0..16u32).flat_map(|v| (v as f32).to_le_bytes()).collect();
+        push(&format!("{prefix}.quant_map"), "F32", vec![16], &quant_map);
+        push(
+            &format!("{prefix}.nested_absmax"),
+            "F32",
+            vec![1],
+            &2.0f32.to_le_bytes(),
+        );
+        push(
+            &format!("{prefix}.nested_quant_map"),
+            "F32",
+            vec![256],
+            &[0u8; 256 * 4],
+        );
+        let quant_state = serde_json::json!({
+            "quant_type": "nf4",
+            "blocksize": 64,
+            "dtype": "bfloat16",
+            "shape": [8, 8],
+            "nested_blocksize": 1,
+            "nested_dtype": "float32",
+            "nested_offset": 0.5
+        })
+        .to_string()
+        .into_bytes();
+        push(
+            &format!("{prefix}.quant_state.bitsandbytes__nf4"),
+            "U8",
+            vec![quant_state.len() as u64],
+            &quant_state,
+        );
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut file = fs::File::create(dir.path().join("model.safetensors")).unwrap();
+        file.write_all(&(header_bytes.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header_bytes).unwrap();
+        file.write_all(&data).unwrap();
+        drop(file);
+
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        match HuggingFaceIngestor::new().ingest(&source) {
+            Err(ProductionIngestionError::UnsupportedFormat { reason }) => {
+                assert!(
+                    reason.contains("layers.0.self_attn.q_proj") && reason.contains("quantized"),
+                    "{reason}"
+                );
+            }
+            Err(other) => panic!("expected UnsupportedFormat, got {other:?}"),
+            Ok(_) => panic!("a quantized projection was split by rows"),
+        }
+    }
 }

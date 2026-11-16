@@ -313,3 +313,256 @@ fn inconsistent_packed_tensors_are_refused() {
         &config,
     )));
 }
+
+/// `stored`, with values starting at `first` so that tensors differ.
+fn stored_from(name: &'static str, shape: &[u64], first: f32) -> Stored {
+    let mut tensor = stored(name, "F32", shape);
+    for value in &mut tensor.values {
+        *value += first;
+    }
+    tensor
+}
+
+/// The transposed `[columns, rows.len()]` matrix whose column `r` is row
+/// `rows[r]` of `values`, a stored `[_, columns]` matrix.
+fn transposed_rows(values: &[f32], columns: usize, rows: &[usize]) -> Vec<f32> {
+    (0..columns)
+        .flat_map(|column| rows.iter().map(move |row| values[row * columns + column]))
+        .collect()
+}
+
+/// Each head's rows `[offset, offset + width)` of a `stride`-row block.
+fn head_rows(heads: usize, stride: usize, offset: usize, width: usize) -> Vec<usize> {
+    (0..heads)
+        .flat_map(|head| (0..width).map(move |row| head * stride + offset + row))
+        .collect()
+}
+
+/// 2 heads, position-independent width 3, rotated width 2, value width 4,
+/// latent rank 5, hidden 6.
+fn latent_config(q_lora_rank: Option<u32>) -> ModelArchitectureConfig {
+    ModelArchitectureConfig {
+        hidden_size: 6,
+        num_hidden_layers: 1,
+        num_attention_heads: 2,
+        latent_attention: Some(magnetar_runtime::model::LatentAttentionConfig {
+            q_lora_rank,
+            kv_lora_rank: 5,
+            qk_nope_head_dim: 3,
+            qk_rope_head_dim: 2,
+            v_head_dim: 4,
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn latent_attention_projections_are_split_by_rows() {
+    for q_lora_rank in [None, Some(4)] {
+        let query_input = q_lora_rank.map_or(6, |rank| rank as usize);
+        let mut tensors = vec![
+            stored_from(
+                "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
+                &[7, 6],
+                100.0,
+            ),
+            stored_from("model.layers.0.self_attn.kv_b_proj.weight", &[14, 5], 200.0),
+            stored_from(
+                "model.layers.0.self_attn.kv_a_layernorm.weight",
+                &[5],
+                300.0,
+            ),
+        ];
+        tensors.push(match q_lora_rank {
+            None => stored_from("model.layers.0.self_attn.q_proj.weight", &[10, 6], 400.0),
+            Some(_) => stored_from("model.layers.0.self_attn.q_b_proj.weight", &[10, 4], 400.0),
+        });
+        let (inventory, payload) = ingest(&tensors, &latent_config(q_lora_rank)).unwrap();
+        let down = &tensors[0].values;
+        let up = &tensors[1].values;
+        let query = &tensors[3].values;
+        let cases = [
+            ("q_nope_proj", query, query_input, head_rows(2, 5, 0, 3)),
+            ("q_rope_proj", query, query_input, head_rows(2, 5, 3, 2)),
+            ("kv_a_proj", down, 6, (0..5).collect()),
+            ("k_rope_proj", down, 6, (5..7).collect()),
+            ("k_nope_proj", up, 5, head_rows(2, 7, 0, 3)),
+            ("v_proj", up, 5, head_rows(2, 7, 3, 4)),
+        ];
+        for (name, values, columns, rows) in cases {
+            let (shape, derived) =
+                read(&inventory, &payload, &format!("layers.0.self_attn.{name}"));
+            assert_eq!(
+                shape,
+                vec![columns as u64, rows.len() as u64],
+                "{name}, {q_lora_rank:?}"
+            );
+            assert_eq!(
+                derived,
+                transposed_rows(values, columns, &rows),
+                "{name}, {q_lora_rank:?}"
+            );
+        }
+        let (shape, values) = read(&inventory, &payload, "layers.0.self_attn.kv_a_norm");
+        assert_eq!(shape, vec![5]);
+        assert_eq!(values, tensors[2].values);
+        assert!(
+            !inventory
+                .iter()
+                .any(|tensor| tensor.name.contains("packed.") || tensor.name.ends_with("q_proj"))
+        );
+    }
+}
+
+#[test]
+fn experts_stored_one_by_one_are_stacked_in_expert_order() {
+    // 2 experts of width 2, hidden 3, one shared expert of width 4.
+    let config = ModelArchitectureConfig {
+        hidden_size: 3,
+        num_hidden_layers: 1,
+        mixture_of_experts: Some(MixtureOfExpertsConfig {
+            experts: 2,
+            experts_per_token: 1,
+            expert_intermediate_size: 2,
+            shared_expert_intermediate_size: Some(4),
+            normalize_top_k: false,
+        }),
+        ..Default::default()
+    };
+    let tensors = [
+        // Expert 1 first: the stack follows the expert index, not the file.
+        stored_from(
+            "model.layers.0.mlp.experts.1.gate_proj.weight",
+            &[2, 3],
+            10.0,
+        ),
+        stored_from(
+            "model.layers.0.mlp.experts.0.gate_proj.weight",
+            &[2, 3],
+            20.0,
+        ),
+        stored_from("model.layers.0.mlp.experts.0.up_proj.weight", &[2, 3], 30.0),
+        stored_from("model.layers.0.mlp.experts.1.up_proj.weight", &[2, 3], 40.0),
+        stored_from(
+            "model.layers.0.mlp.experts.0.down_proj.weight",
+            &[3, 2],
+            50.0,
+        ),
+        stored_from(
+            "model.layers.0.mlp.experts.1.down_proj.weight",
+            &[3, 2],
+            60.0,
+        ),
+        stored_from("model.layers.0.mlp.gate.weight", &[2, 3], 70.0),
+        stored_from(
+            "model.layers.0.mlp.gate.e_score_correction_bias",
+            &[2],
+            80.0,
+        ),
+        stored_from(
+            "model.layers.0.mlp.shared_experts.up_proj.weight",
+            &[4, 3],
+            90.0,
+        ),
+    ];
+    let (inventory, payload) = ingest(&tensors, &config).unwrap();
+    let concat =
+        |first: &Stored, second: &Stored| [first.values.clone(), second.values.clone()].concat();
+    let cases = [
+        ("experts_gate_proj", concat(&tensors[1], &tensors[0]), 3, 4),
+        ("experts_up_proj", concat(&tensors[2], &tensors[3]), 3, 4),
+        ("experts_down_proj", concat(&tensors[4], &tensors[5]), 2, 6),
+        ("router_proj", tensors[6].values.clone(), 3, 2),
+        ("shared_up_proj", tensors[8].values.clone(), 3, 4),
+    ];
+    for (name, stacked, columns, rows) in cases {
+        let (shape, values) = read(&inventory, &payload, &format!("layers.0.moe.{name}"));
+        assert_eq!(shape, vec![columns as u64, rows as u64], "{name}");
+        assert_eq!(
+            values,
+            transposed_rows(&stacked, columns, &(0..rows).collect::<Vec<_>>()),
+            "{name}"
+        );
+    }
+    let (shape, values) = read(&inventory, &payload, "layers.0.moe.selection_bias");
+    assert_eq!(shape, vec![2]);
+    assert_eq!(values, tensors[7].values);
+    assert!(
+        !inventory
+            .iter()
+            .any(|tensor| tensor.name.contains("packed."))
+    );
+}
+
+#[test]
+fn inconsistent_latent_or_per_expert_tensors_are_refused() {
+    let malformed = |result: Result<_, ProductionIngestionError>| {
+        matches!(
+            result.map(|_| ()),
+            Err(ProductionIngestionError::MalformedMetadata { .. })
+        )
+    };
+    let latent = || {
+        vec![
+            stored("model.layers.0.self_attn.q_proj.weight", "F32", &[10, 6]),
+            stored(
+                "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
+                "F32",
+                &[7, 6],
+            ),
+            stored("model.layers.0.self_attn.kv_b_proj.weight", "F32", &[14, 5]),
+        ]
+    };
+    assert!(ingest(&latent(), &latent_config(None)).is_ok());
+    // No declared latent attention.
+    let mut config = latent_config(None);
+    config.latent_attention = None;
+    assert!(malformed(ingest(&latent(), &config)));
+    // A low-rank query declared, but the full query projection stored.
+    assert!(malformed(ingest(&latent(), &latent_config(Some(4)))));
+    // A key and value projection of the wrong height.
+    let mut tensors = latent();
+    tensors[2] = stored("model.layers.0.self_attn.kv_b_proj.weight", "F32", &[12, 5]);
+    assert!(malformed(ingest(&tensors, &latent_config(None))));
+
+    let config = ModelArchitectureConfig {
+        hidden_size: 3,
+        num_hidden_layers: 1,
+        mixture_of_experts: Some(MixtureOfExpertsConfig {
+            experts: 2,
+            experts_per_token: 1,
+            expert_intermediate_size: 2,
+            shared_expert_intermediate_size: None,
+            normalize_top_k: false,
+        }),
+        ..Default::default()
+    };
+    let expert = |name| stored(name, "F32", &[2, 3]);
+    // Expert 1's projection missing.
+    assert!(malformed(ingest(
+        &[expert("model.layers.0.mlp.experts.0.gate_proj.weight")],
+        &config,
+    )));
+    // An expert of another width.
+    assert!(malformed(ingest(
+        &[
+            expert("model.layers.0.mlp.experts.0.gate_proj.weight"),
+            stored(
+                "model.layers.0.mlp.experts.1.gate_proj.weight",
+                "F32",
+                &[3, 3]
+            ),
+        ],
+        &config,
+    )));
+    // No declared mixture of experts.
+    let mut no_experts = config.clone();
+    no_experts.mixture_of_experts = None;
+    assert!(malformed(ingest(
+        &[
+            expert("model.layers.0.mlp.experts.0.gate_proj.weight"),
+            expert("model.layers.0.mlp.experts.1.gate_proj.weight"),
+        ],
+        &no_experts,
+    )));
+}
