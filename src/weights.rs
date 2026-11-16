@@ -103,6 +103,52 @@ impl ProductionArtifactPayloadSource for SafetensorsPayloadSource {
     }
 }
 
+impl SafetensorsPayloadSource {
+    /// The stored byte length of tensor `identity`.
+    pub(crate) fn tensor_length(&self, identity: &str) -> Result<u64, ProductionIngestionError> {
+        self.locations
+            .get(identity)
+            .map(|location| location.length)
+            .ok_or_else(|| ProductionIngestionError::PayloadOutOfBounds {
+                identity: identity.to_string(),
+            })
+    }
+
+    /// Reads `length` bytes at `offset` within the stored tensor
+    /// `identity`, for tensors derived from part of a stored one
+    /// (`layered_tensors.rs`).
+    pub(crate) fn read_within(
+        &self,
+        identity: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, ProductionIngestionError> {
+        let out_of_bounds = || ProductionIngestionError::PayloadOutOfBounds {
+            identity: identity.to_string(),
+        };
+        let location = self.locations.get(identity).ok_or_else(out_of_bounds)?;
+        if offset
+            .checked_add(length)
+            .is_none_or(|end| end > location.length)
+        {
+            return Err(out_of_bounds());
+        }
+        let start = location
+            .data_section_start
+            .checked_add(location.offset)
+            .and_then(|start| start.checked_add(offset))
+            .ok_or_else(out_of_bounds)?;
+        let unavailable = |error: std::io::Error| ProductionIngestionError::PayloadUnavailable {
+            identity: format!("{identity}: {error}"),
+        };
+        let mut file = fs::File::open(&location.shard_path).map_err(unavailable)?;
+        file.seek(SeekFrom::Start(start)).map_err(unavailable)?;
+        let mut buffer = vec![0u8; usize::try_from(length).map_err(|_| out_of_bounds())?];
+        file.read_exact(&mut buffer).map_err(unavailable)?;
+        Ok(buffer)
+    }
+}
+
 /// Reads the 8-byte little-endian header-length prefix every Safetensors
 /// file begins with and returns the data section's start offset
 /// (`8 + header_length`), without re-parsing the header itself (the
@@ -165,6 +211,19 @@ pub enum WeightsPayloadSource {
     Gptq(crate::gptq::GptqDequantizingPayloadSource<SafetensorsPayloadSource>),
     Awq(crate::awq::AwqDequantizingPayloadSource<SafetensorsPayloadSource>),
     Bnb(crate::bnb::BnbDequantizingPayloadSource<SafetensorsPayloadSource>),
+}
+
+impl WeightsPayloadSource {
+    /// The source the stored tensors are read from, whatever dequantizes
+    /// the quantized projections on top of it.
+    pub(crate) fn plain(&self) -> &SafetensorsPayloadSource {
+        match self {
+            Self::Plain(source) => source,
+            Self::Gptq(source) => source.inner(),
+            Self::Awq(source) => source.inner(),
+            Self::Bnb(source) => source.inner(),
+        }
+    }
 }
 
 impl ProductionArtifactPayloadSource for WeightsPayloadSource {

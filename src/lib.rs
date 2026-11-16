@@ -24,6 +24,7 @@ mod chat_template;
 mod config;
 mod derived_lm_head;
 mod gptq;
+mod layered_tensors;
 mod naming;
 mod tokenizer;
 mod weight_layout;
@@ -160,6 +161,14 @@ impl ProductionModelArtifactIngestor for HuggingFaceIngestor {
         // transposed -- as are any GPTQ- or AWQ-dequantized projections
         // (`quantized_projection_names`), already `[in_features,
         // out_features]` by construction (`gptq.rs`/`awq.rs`).
+        // A layered decoder's packed per-layer tables and routed experts,
+        // cut into the tensors its Component requests
+        // (`layered_tensors.rs`), still in `[out, in]` orientation.
+        let payload_source = layered_tensors::derive(
+            &mut tensors,
+            payload_source,
+            &normalized_config.architecture_config,
+        )?;
         let transposing_source = weight_layout::TransposingPayloadSource::new(
             payload_source,
             &tensors,

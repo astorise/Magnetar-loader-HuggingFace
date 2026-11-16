@@ -49,9 +49,9 @@ pub fn is_non_text_tensor(raw: &str) -> bool {
 ///   it).
 /// - a multimodal bundle's text decoder (`model.language_model.*`) takes
 ///   the same names, plus the layered decoders' own norms, `q_norm`/`k_norm`,
-///   `layer_scalar` and per-layer input weights; tables packing every
-///   layer's weights and routed experts are refused until loading slices
-///   or restacks them.
+///   `layer_scalar` and per-layer input weights. Tables packing every
+///   layer's weights and routed experts take internal names that
+///   `layered_tensors.rs` replaces with the per-layer and stacked tensors.
 pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionError> {
     // A multimodal bundle nests its text decoder under `language_model`.
     let unnested;
@@ -71,24 +71,23 @@ pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionErr
         return Ok(format!("layers.{layer_index}.layer_scalar"));
     }
     // Routed experts' stacked tensors and router scales carry no `.weight`
-    // suffix either.
-    if let Some((_, field)) = raw
+    // suffix either; `layered_tensors.rs` restacks the experts and folds
+    // the router scale.
+    if let Some((layer_index, field)) = raw
         .strip_prefix("model.layers.")
         .and_then(|rest| rest.split_once('.'))
-        && matches!(
-            field,
-            "experts.gate_up_proj"
-                | "experts.down_proj"
-                | "router.scale"
-                | "router.per_expert_scale"
-        )
+        && layer_index.parse::<u64>().is_ok()
     {
-        return Err(ProductionIngestionError::UnsupportedFormat {
-            reason: format!(
-                "tensor '{raw}' belongs to routed experts stored per checkpoint convention, \
-                 which Hugging Face loading does not restack yet"
-            ),
-        });
+        let canonical = match field {
+            "experts.gate_up_proj" => Some(crate::layered_tensors::EXPERTS_GATE_UP),
+            "experts.down_proj" => Some("moe.experts_down_proj"),
+            "router.scale" => Some(crate::layered_tensors::ROUTER_SCALE),
+            "router.per_expert_scale" => Some("moe.per_expert_scale"),
+            _ => None,
+        };
+        if let Some(canonical) = canonical {
+            return Ok(format!("layers.{layer_index}.{canonical}"));
+        }
     }
     if let Some(suffix) = raw.strip_suffix(".bias") {
         if let Some(layer_suffix) = suffix.strip_prefix("model.layers.")
@@ -130,17 +129,13 @@ pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionErr
     if name == "model.per_layer_projection_norm" {
         return Ok("per_layer_projection_norm".to_string());
     }
-    if matches!(
-        name,
-        "model.embed_tokens_per_layer" | "model.per_layer_model_projection"
-    ) {
-        // Each layer reads its own column (row) slice of these tables.
-        return Err(ProductionIngestionError::UnsupportedFormat {
-            reason: format!(
-                "tensor '{raw}' packs every layer's per-layer input weights into one table, \
-                 which Hugging Face loading does not slice per layer yet"
-            ),
-        });
+    // Each layer reads its own column (row) slice of these tables
+    // (`layered_tensors.rs`).
+    if name == "model.embed_tokens_per_layer" {
+        return Ok(crate::layered_tensors::PER_LAYER_EMBEDDING_TABLE.to_string());
+    }
+    if name == "model.per_layer_model_projection" {
+        return Ok(crate::layered_tensors::PER_LAYER_PROJECTION_TABLE.to_string());
     }
     if let Some(layer_suffix) = name.strip_prefix("model.layers.") {
         let (layer_index, rest) = layer_suffix.split_once('.').ok_or_else(|| {
@@ -174,18 +169,7 @@ pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionErr
             "per_layer_input_gate" => "per_layer_input_gate",
             "per_layer_projection" => "per_layer_projection",
             "post_per_layer_input_norm" => "post_per_layer_input_norm",
-            "router.proj"
-            | "router.scale"
-            | "router.per_expert_scale"
-            | "experts.gate_up_proj"
-            | "experts.down_proj" => {
-                return Err(ProductionIngestionError::UnsupportedFormat {
-                    reason: format!(
-                        "tensor '{raw}' belongs to routed experts stored per checkpoint \
-                         convention, which Hugging Face loading does not restack yet"
-                    ),
-                });
-            }
+            "router.proj" => crate::layered_tensors::ROUTER_PROJECTION,
             other => {
                 return Err(ProductionIngestionError::MalformedMetadata {
                     reason: format!(
@@ -336,7 +320,7 @@ mod layered_tests {
     }
 
     #[test]
-    fn non_text_towers_are_recognized_and_unsliced_tables_refused() {
+    fn non_text_towers_are_recognized() {
         assert!(is_non_text_tensor(
             "model.vision_tower.encoder.layers.0.mlp.fc1.weight"
         ));
@@ -344,19 +328,44 @@ mod layered_tests {
             "model.embed_audio.embedding_projection.weight"
         ));
         assert!(!is_non_text_tensor("model.language_model.norm.weight"));
-        for raw in [
-            "model.language_model.embed_tokens_per_layer.weight",
-            "model.language_model.per_layer_model_projection.weight",
-            "model.language_model.layers.0.experts.gate_up_proj",
-            "model.language_model.layers.0.router.proj.weight",
-        ] {
-            assert!(
-                matches!(
-                    normalize_tensor_name(raw),
-                    Err(ProductionIngestionError::UnsupportedFormat { .. })
-                ),
-                "{raw}"
-            );
+    }
+
+    /// Packed per-layer tables and routed experts take the names
+    /// `layered_tensors.rs` derives the requested tensors from.
+    #[test]
+    fn packed_tables_and_experts_take_their_derivation_names() {
+        let cases = [
+            (
+                "model.language_model.embed_tokens_per_layer.weight",
+                "packed.embed_tokens_per_layer",
+            ),
+            (
+                "model.language_model.per_layer_model_projection.weight",
+                "packed.per_layer_model_projection",
+            ),
+            (
+                "model.language_model.layers.3.experts.gate_up_proj",
+                "layers.3.packed.experts_gate_up",
+            ),
+            (
+                "model.language_model.layers.3.experts.down_proj",
+                "layers.3.moe.experts_down_proj",
+            ),
+            (
+                "model.language_model.layers.3.router.proj.weight",
+                "layers.3.packed.router_proj",
+            ),
+            (
+                "model.language_model.layers.3.router.scale",
+                "layers.3.packed.router_scale",
+            ),
+            (
+                "model.language_model.layers.3.router.per_expert_scale",
+                "layers.3.moe.per_expert_scale",
+            ),
+        ];
+        for (raw, canonical) in cases {
+            assert_eq!(normalize_tensor_name(raw).unwrap(), canonical, "{raw}");
         }
     }
 }
