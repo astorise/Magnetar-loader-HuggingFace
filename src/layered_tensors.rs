@@ -388,9 +388,6 @@ pub fn derive(
     Ok(LayeredTensorSource { inner, derived })
 }
 
-/// How many rows a [`Derivation::Columns`] read covers at once.
-const COLUMN_CHUNK_BYTES: u64 = 64 << 20;
-
 impl ProductionArtifactPayloadSource for LayeredTensorSource {
     fn read_payload(
         &self,
@@ -414,16 +411,7 @@ impl ProductionArtifactPayloadSource for LayeredTensorSource {
                 start,
                 width,
             } => {
-                let chunk_rows = (COLUMN_CHUNK_BYTES / row_bytes).max(1);
-                let mut row = 0;
-                while row < *rows {
-                    let count = chunk_rows.min(rows - row);
-                    let chunk = plain.read_within(source, row * row_bytes, count * row_bytes)?;
-                    for stored in chunk.chunks_exact(*row_bytes as usize) {
-                        bytes.extend_from_slice(&stored[*start as usize..(start + width) as usize]);
-                    }
-                    row += count;
-                }
+                bytes = plain.read_rows(source, *start, *row_bytes, *width, *rows)?;
             }
             Derivation::Ranges { source, ranges } => {
                 for (offset, length) in ranges {

@@ -114,6 +114,55 @@ impl SafetensorsPayloadSource {
             })
     }
 
+    /// Reads `length` bytes at `offset + row * stride` within the stored
+    /// tensor `identity` for each of `rows` rows, concatenated: a column
+    /// slice, read without the other columns (`layered_tensors.rs`).
+    pub(crate) fn read_rows(
+        &self,
+        identity: &str,
+        offset: u64,
+        stride: u64,
+        length: u64,
+        rows: u64,
+    ) -> Result<Vec<u8>, ProductionIngestionError> {
+        let out_of_bounds = || ProductionIngestionError::PayloadOutOfBounds {
+            identity: identity.to_string(),
+        };
+        let location = self.locations.get(identity).ok_or_else(out_of_bounds)?;
+        let end = rows
+            .checked_sub(1)
+            .and_then(|last| last.checked_mul(stride))
+            .and_then(|last| last.checked_add(offset))
+            .and_then(|last| last.checked_add(length));
+        if end.is_some_and(|end| end > location.length) || (rows > 0 && end.is_none()) {
+            return Err(out_of_bounds());
+        }
+        let start = location
+            .data_section_start
+            .checked_add(location.offset)
+            .and_then(|start| start.checked_add(offset))
+            .ok_or_else(out_of_bounds)?;
+        let unavailable = |error: std::io::Error| ProductionIngestionError::PayloadUnavailable {
+            identity: format!("{identity}: {error}"),
+        };
+        let width = usize::try_from(length).map_err(|_| out_of_bounds())?;
+        let total = rows
+            .checked_mul(length)
+            .and_then(|total| usize::try_from(total).ok())
+            .ok_or_else(out_of_bounds)?;
+        let mut buffer = vec![0u8; total];
+        if width == 0 {
+            return Ok(buffer);
+        }
+        let mut file = fs::File::open(&location.shard_path).map_err(unavailable)?;
+        for (row, slice) in buffer.chunks_exact_mut(width).enumerate() {
+            file.seek(SeekFrom::Start(start + row as u64 * stride))
+                .map_err(unavailable)?;
+            file.read_exact(slice).map_err(unavailable)?;
+        }
+        Ok(buffer)
+    }
+
     /// Reads `length` bytes at `offset` within the stored tensor
     /// `identity`, for tensors derived from part of a stored one
     /// (`layered_tensors.rs`).
