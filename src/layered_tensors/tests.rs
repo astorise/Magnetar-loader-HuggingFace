@@ -403,6 +403,20 @@ fn latent_attention_projections_are_split_by_rows() {
                 "{name}, {q_lora_rank:?}"
             );
         }
+        // The absorbed decode's tables: the key and value rows as stored.
+        for (name, rows) in [
+            ("k_absorb", head_rows(2, 7, 0, 3)),
+            ("v_absorb", head_rows(2, 7, 3, 4)),
+        ] {
+            let (shape, derived) =
+                read(&inventory, &payload, &format!("layers.0.self_attn.{name}"));
+            assert_eq!(shape, vec![rows.len() as u64, 5], "{name}, {q_lora_rank:?}");
+            let expected: Vec<f32> = rows
+                .iter()
+                .flat_map(|row| up[row * 5..(row + 1) * 5].iter().copied())
+                .collect();
+            assert_eq!(derived, expected, "{name}, {q_lora_rank:?}");
+        }
         let (shape, values) = read(&inventory, &payload, "layers.0.self_attn.kv_a_norm");
         assert_eq!(shape, vec![5]);
         assert_eq!(values, tensors[2].values);
