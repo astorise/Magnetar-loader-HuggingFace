@@ -372,6 +372,22 @@ fn routed_experts(
             });
         }
     };
+    // DeepSeek-V2's own code renormalizes the chosen weights when
+    // `norm_topk_prob` is set and scales them by `routed_scaling_factor`
+    // otherwise; transformers' port ignores `norm_topk_prob` and always
+    // scales. The two agree only without renormalization, as every published
+    // V2 configuration declares, so the other case is refused rather than
+    // guessed. `noaux_tc` (V3) renormalizes, then scales, in both.
+    if raw.norm_topk_prob == Some(true) && !selection_bias {
+        return Err(ProductionIngestionError::UnsupportedFormat {
+            reason: format!(
+                "config.json renormalizes the top-{experts_per_token} weights \
+                 ('norm_topk_prob') with topk_method '{}', whose reference \
+                 implementations disagree on it",
+                raw.topk_method.as_deref().unwrap_or("greedy")
+            ),
+        });
+    }
     let routing = ExpertRoutingConfig {
         scoring,
         groups,
@@ -1410,6 +1426,38 @@ mod latent_attention_tests {
             })
         );
         config.validate().unwrap();
+    }
+
+    /// DeepSeek-V2's own code and transformers disagree on renormalized
+    /// greedy or group-limited routing, so it is refused; V3's `noaux_tc`
+    /// renormalizes in both.
+    #[test]
+    fn renormalized_v2_routing_is_refused() {
+        let path = format!(
+            "{}/testdata/deepseek/DeepSeek-V2-Lite.config.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        raw["norm_topk_prob"] = serde_json::json!(true);
+        assert!(matches!(
+            parse(&serde_json::to_vec(&raw).unwrap()),
+            Err(ProductionIngestionError::UnsupportedFormat { .. })
+        ));
+        raw["topk_method"] = serde_json::json!("group_limited_greedy");
+        raw["n_group"] = serde_json::json!(8);
+        raw["topk_group"] = serde_json::json!(3);
+        assert!(matches!(
+            parse(&serde_json::to_vec(&raw).unwrap()),
+            Err(ProductionIngestionError::UnsupportedFormat { .. })
+        ));
+        assert!(
+            parse_deepseek("DeepSeek-V3")
+                .architecture_config
+                .mixture_of_experts
+                .unwrap()
+                .normalize_top_k
+        );
     }
 
     #[test]
