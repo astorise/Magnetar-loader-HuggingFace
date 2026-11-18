@@ -26,7 +26,11 @@
 //!   rotated key's, and becomes `self_attn.kv_a_proj` and
 //!   `self_attn.k_rope_proj`; `kv_b_proj` stores each head's key rows
 //!   before its value rows, and becomes `self_attn.k_nope_proj` and
-//!   `self_attn.v_proj`. Row splits copy bytes, so they are exact.
+//!   `self_attn.v_proj`. Row splits copy bytes, so they are exact. The
+//!   same key and value rows are also `self_attn.k_absorb` and
+//!   `self_attn.v_absorb` (`cache-latent-attention-history`): not
+//!   projections, so they keep the stored `[out, in]` orientation, which is
+//!   what absorbed decode attention multiplies by head.
 //! - Routed experts stored one by one (`mlp.experts.E.{gate,up,down}_proj`)
 //!   are stacked in expert order into `moe.experts_{gate,up,down}_proj`, the
 //!   same layout as the restacked `experts.gate_up_proj` above.
@@ -603,6 +607,9 @@ fn derive_latent_attention(
             &key_nope,
         )?;
         insert_rows(derived, added, &up, &layer, "self_attn.v_proj", &values)?;
+        // The absorbed decode's tables: the same rows, kept `[out, in]`.
+        insert_rows(derived, added, &up, &layer, "self_attn.k_absorb", &key_nope)?;
+        insert_rows(derived, added, &up, &layer, "self_attn.v_absorb", &values)?;
     }
     Ok(())
 }
