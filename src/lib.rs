@@ -23,6 +23,7 @@ mod bnb;
 mod chat_template;
 mod config;
 mod derived_lm_head;
+pub mod fp8;
 mod gptq;
 mod layered_tensors;
 mod naming;

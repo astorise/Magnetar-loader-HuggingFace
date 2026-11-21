@@ -30,6 +30,10 @@ file in memory. `src/tokenizer.rs` loads a real tokenizer through the
 is the only place in the workspace that depends on it), validating
 vocabulary size against the model's declared `vocab_size`.
 
+`src/fp8.rs` contains an E4M3FN block conversion reference, tested against
+PyTorch for every byte value and partial tiles. FP8 Safetensors ingestion is
+not yet enabled: associating and validating scale tensors remains necessary.
+
 Parsing/normalizing a bundle never grants trust: the `ModelManifest` this
 crate produces still goes through `magnetar-runtime`'s own
 `ModelManifest::validate` and `ModelTrustStore::evaluate` like any other
