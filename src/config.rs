@@ -149,6 +149,8 @@ struct RawHfConfig {
     /// `softmax` (absent) or `sigmoid`.
     #[serde(default)]
     scoring_func: Option<String>,
+    #[serde(default)]
+    rope_interleave: Option<bool>,
 }
 
 /// One layer type's RoPE in `rope_parameters`, or the whole of a flat one.
@@ -308,6 +310,7 @@ fn latent_attention(
         qk_nope_head_dim: field(raw.qk_nope_head_dim, "qk_nope_head_dim")?,
         qk_rope_head_dim: field(raw.qk_rope_head_dim, "qk_rope_head_dim")?,
         v_head_dim: field(raw.v_head_dim, "v_head_dim")?,
+        norm_eps: (raw.model_type.as_deref() == Some("glm4_moe_lite")).then_some(1e-6),
     }))
 }
 
@@ -801,6 +804,11 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
     let num_key_value_heads = raw.num_key_value_heads.unwrap_or(num_attention_heads);
     let vocab_size = required(raw.vocab_size, "vocab_size")?;
     let model_type = required(raw.model_type.clone(), "model_type")?;
+    if model_type == "glm4_moe_lite" && raw.rope_interleave == Some(false) {
+        return Err(ProductionIngestionError::UnsupportedFormat {
+            reason: "GLM non-interleaved rotary weights are not supported".into(),
+        });
+    }
 
     // OLMo 3 alternates three sliding layers with a full-attention layer
     // when layer_types is omitted. Preserve that upstream default instead
@@ -1917,6 +1925,7 @@ mod latent_attention_tests {
                 .architecture_config
         };
         let config = parse_raw(&raw);
+        assert_eq!(config.latent_attention.unwrap().norm_eps, Some(1e-6));
         let routing = config.expert_routing.unwrap();
         assert_eq!(routing.scoring, ExpertScoring::Sigmoid);
         assert_eq!(
@@ -1958,6 +1967,9 @@ mod latent_attention_tests {
         raw["scoring_func"] = serde_json::json!("softmax");
         assert!(parse(&serde_json::to_vec(&raw).unwrap()).is_err());
         raw.as_object_mut().unwrap().remove("scoring_func");
+        raw["rope_interleave"] = serde_json::json!(false);
+        assert!(parse(&serde_json::to_vec(&raw).unwrap()).is_err());
+        raw.as_object_mut().unwrap().remove("rope_interleave");
         raw["mlp_layer_types"] = serde_json::json!(["dense"]);
         assert!(parse(&serde_json::to_vec(&raw).unwrap()).is_err());
     }
@@ -1985,6 +1997,7 @@ mod latent_attention_tests {
                 qk_nope_head_dim: 128,
                 qk_rope_head_dim: 64,
                 v_head_dim: 128,
+                norm_eps: None,
             })
         );
         assert_eq!(config.head_dim, 192);

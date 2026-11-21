@@ -84,8 +84,10 @@ pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionErr
         && layer_index.parse::<u64>().is_ok()
     {
         let canonical = match field {
-            "experts.gate_up_proj" => Some(crate::layered_tensors::EXPERTS_GATE_UP),
-            "experts.down_proj" => Some("moe.experts_down_proj"),
+            "experts.gate_up_proj" | "mlp.experts.gate_up_proj" => {
+                Some(crate::layered_tensors::EXPERTS_GATE_UP)
+            }
+            "experts.down_proj" | "mlp.experts.down_proj" => Some("moe.experts_down_proj"),
             "router.scale" => Some(crate::layered_tensors::ROUTER_SCALE),
             "router.per_expert_scale" => Some("moe.per_expert_scale"),
             // A sigmoid router's selection-only bias per expert.
