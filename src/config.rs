@@ -52,6 +52,14 @@ struct RawHfConfig {
     max_position_embeddings: Option<u64>,
     #[serde(default)]
     hidden_act: Option<String>,
+    #[serde(default)]
+    no_rope_layers: Option<Vec<u8>>,
+    #[serde(default)]
+    no_rope_layer_interval: Option<u32>,
+    #[serde(default)]
+    use_sliding_window: Option<bool>,
+    #[serde(default)]
+    mlp_bias: Option<bool>,
     // Layered decoders (`per-layer-kv-geometry`): read by `layered_config`.
     /// One `"sliding_attention"` or `"full_attention"` per layer.
     #[serde(default)]
@@ -486,16 +494,7 @@ fn layered_config(
     num_attention_heads: u32,
     head_dim: u64,
 ) -> Result<Option<LayeredConfig>, ProductionIngestionError> {
-    let Some(layer_types) = &raw.layer_types else {
-        return Ok(None);
-    };
     let malformed = |reason: String| ProductionIngestionError::MalformedMetadata { reason };
-    if layer_types.len() != num_hidden_layers as usize {
-        return Err(malformed(format!(
-            "config.json's layer_types has {} entries for {num_hidden_layers} layers",
-            layer_types.len()
-        )));
-    }
     if raw.use_bidirectional_attention.as_deref() == Some("all") {
         return Err(ProductionIngestionError::UnsupportedFormat {
             reason: "config.json declares bidirectional attention for every token; only causal \
@@ -503,12 +502,64 @@ fn layered_config(
                 .into(),
         });
     }
+    if raw.model_type.as_deref() == Some("mistral") && raw.sliding_window == Some(0) {
+        return Err(malformed(
+            "config.json's sliding_window must be positive".into(),
+        ));
+    }
+    let Some(layer_types) = &raw.layer_types else {
+        // Mistral v0.1 declares one window for every decoder layer without
+        // a layer_types array. Other families can give sliding_window a
+        // different meaning (for example, behind an enable flag), so do not
+        // infer their attention semantics from that field alone.
+        if raw.model_type.as_deref() != Some("mistral") || raw.sliding_window.is_none() {
+            return Ok(None);
+        }
+        let window = raw.sliding_window.unwrap();
+        // Avoid allocating an unbounded layout from untrusted metadata.
+        if num_hidden_layers > 4096 {
+            return Err(malformed(
+                "config.json declares too many decoder layers".into(),
+            ));
+        }
+        let flat_theta = rope_parameters(raw)?
+            .get("")
+            .and_then(|flat| flat.rope_theta);
+        let rope_theta = raw.rope_theta.or(flat_theta).unwrap_or(10_000.0);
+        let layer = LayerSpec {
+            sliding_window: Some(window),
+            head_dim,
+            num_key_value_heads: raw.num_key_value_heads.unwrap_or(num_attention_heads),
+            rope_theta,
+            partial_rotary_factor: None,
+            value_from_key: false,
+            kv_source_layer: None,
+            intermediate_size: raw.intermediate_size.unwrap_or_default(),
+        };
+        return Ok(Some(LayeredConfig {
+            layout: Some(vec![layer; num_hidden_layers as usize]),
+            rope_theta,
+        }));
+    };
+    if layer_types.len() != num_hidden_layers as usize {
+        return Err(malformed(format!(
+            "config.json's layer_types has {} entries for {num_hidden_layers} layers",
+            layer_types.len()
+        )));
+    }
     let intermediate_size = raw.intermediate_size.unwrap_or_default();
     let num_key_value_heads = raw.num_key_value_heads.unwrap_or(num_attention_heads);
     let k_eq_v = raw.attention_k_eq_v.unwrap_or(false);
     let rope_parameters = rope_parameters(raw)?;
     let flat_theta = rope_parameters.get("").and_then(|flat| flat.rope_theta);
-    let default_theta = raw.rope_theta.or(flat_theta).unwrap_or(10_000.0);
+    let default_theta = raw
+        .rope_theta
+        .or(flat_theta)
+        .unwrap_or(match raw.model_type.as_deref() {
+            Some("olmo3") => 500_000.0,
+            Some("smollm3") => 2_000_000.0,
+            _ => 10_000.0,
+        });
     let rope = |layer_type: &str| -> Result<(f64, Option<f64>), ProductionIngestionError> {
         let Some(parameters) = rope_parameters.get(layer_type) else {
             return Ok((default_theta, None));
@@ -661,13 +712,25 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
             .get("architectures")
             .and_then(|value| serde_json::from_value(value.clone()).ok())
     });
-    let mut raw: RawHfConfig =
-        serde_json::from_value(nested.unwrap_or(value)).map_err(shape_error)?;
+    let config_value = nested.unwrap_or(value);
+    let window_missing = config_value.get("sliding_window").is_none();
+    let rope_interval_is_null = config_value
+        .get("no_rope_layer_interval")
+        .is_some_and(serde_json::Value::is_null);
+    let activation_is_null = config_value
+        .get("hidden_act")
+        .is_some_and(|value| value.is_null());
+    let mut raw: RawHfConfig = serde_json::from_value(config_value).map_err(shape_error)?;
     if let Some(model_type) = outer_model_type {
         raw.model_type = Some(model_type);
     }
     if let Some(architectures) = outer_architectures {
         raw.architectures = architectures;
+    }
+    // MistralConfig's upstream default is 4096 when the field is absent;
+    // an explicit null, as in v0.2/v0.3, disables sliding attention.
+    if raw.model_type.as_deref() == Some("mistral") && window_missing {
+        raw.sliding_window = Some(4096);
     }
 
     let hidden_size = required(raw.hidden_size, "hidden_size")?;
@@ -677,6 +740,55 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
     let num_key_value_heads = raw.num_key_value_heads.unwrap_or(num_attention_heads);
     let vocab_size = required(raw.vocab_size, "vocab_size")?;
     let model_type = required(raw.model_type.clone(), "model_type")?;
+
+    // OLMo 3 alternates three sliding layers with a full-attention layer
+    // when layer_types is omitted. Preserve that upstream default instead
+    // of accidentally treating the whole model as full attention.
+    if model_type == "olmo3" {
+        if window_missing {
+            raw.sliding_window = Some(4096);
+        }
+        if raw.layer_types.is_none() {
+            if num_hidden_layers > 4096 {
+                return Err(ProductionIngestionError::MalformedMetadata {
+                    reason: "config.json declares too many decoder layers".into(),
+                });
+            }
+            raw.layer_types = Some(
+                (0..num_hidden_layers)
+                    .map(|index| {
+                        if (index + 1) % 4 == 0 {
+                            "full_attention"
+                        } else {
+                            "sliding_attention"
+                        }
+                        .to_string()
+                    })
+                    .collect(),
+            );
+        }
+    }
+
+    // The currently supported components for these families implement SiLU.
+    // Reject alternatives until a Component implements and qualifies them.
+    // An omitted field follows these model classes' SiLU default; explicit
+    // null is malformed and must not be mistaken for an omitted field.
+    if activation_is_null {
+        return Err(ProductionIngestionError::MalformedMetadata {
+            reason: "config.json's hidden_act must be a supported activation string".into(),
+        });
+    }
+    if matches!(
+        model_type.as_str(),
+        "llama" | "qwen2" | "qwen2moe" | "qwen2_moe" | "mistral" | "olmo3" | "smollm3"
+    ) && let Some(activation) = raw.hidden_act.as_deref().filter(|value| *value != "silu")
+    {
+        return Err(ProductionIngestionError::UnsupportedFormat {
+            reason: format!(
+                "config.json's hidden_act '{activation}' is not supported for {model_type}; only silu is available"
+            ),
+        });
+    }
 
     if hidden_size == 0 || intermediate_size == 0 || vocab_size == 0 {
         return Err(ProductionIngestionError::MalformedMetadata {
@@ -689,6 +801,66 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
             reason: "config.json declares a zero-valued layer/head count".into(),
         });
     }
+    let rope_layers = if model_type == "smollm3" {
+        if num_hidden_layers > 4096 {
+            return Err(ProductionIngestionError::MalformedMetadata {
+                reason: "config.json declares too many decoder layers".into(),
+            });
+        }
+        if raw.use_sliding_window == Some(true) || raw.mlp_bias == Some(true) {
+            return Err(ProductionIngestionError::UnsupportedFormat {
+                reason: "SmolLM3 sliding attention and MLP bias are not supported".into(),
+            });
+        }
+        if let Some(types) = &raw.layer_types
+            && (types.len() != num_hidden_layers as usize
+                || types.iter().any(|kind| kind != "full_attention"))
+        {
+            return Err(ProductionIngestionError::UnsupportedFormat {
+                reason: "SmolLM3 requires one full_attention layer type per decoder layer".into(),
+            });
+        }
+        let layers = if let Some(mask) = &raw.no_rope_layers {
+            if mask.len() < num_hidden_layers as usize {
+                return Err(ProductionIngestionError::MalformedMetadata {
+                    reason: format!(
+                        "config.json's no_rope_layers has {} entries for {num_hidden_layers} layers",
+                        mask.len()
+                    ),
+                });
+            }
+            mask.iter()
+                .take(num_hidden_layers as usize)
+                .enumerate()
+                .map(|(layer, &entry)| match entry {
+                    0 => Ok(false),
+                    1 => Ok(true),
+                    _ => Err(ProductionIngestionError::MalformedMetadata {
+                        reason: format!("config.json's no_rope_layers[{layer}] must be 0 or 1"),
+                    }),
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            if rope_interval_is_null {
+                return Err(ProductionIngestionError::MalformedMetadata {
+                    reason: "config.json's no_rope_layer_interval must be a positive integer"
+                        .into(),
+                });
+            }
+            let interval = raw.no_rope_layer_interval.unwrap_or(4);
+            if interval == 0 {
+                return Err(ProductionIngestionError::MalformedMetadata {
+                    reason: "config.json's no_rope_layer_interval must be positive".into(),
+                });
+            }
+            (0..num_hidden_layers)
+                .map(|layer| (layer + 1) % interval != 0)
+                .collect()
+        };
+        Some(layers)
+    } else {
+        None
+    };
     if !num_attention_heads.is_multiple_of(num_key_value_heads) {
         return Err(ProductionIngestionError::MalformedMetadata {
             reason: format!(
@@ -728,7 +900,9 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
         });
     }
 
-    let rms_norm_eps = raw.rms_norm_eps.unwrap_or(1e-6) as f32;
+    let rms_norm_eps = raw
+        .rms_norm_eps
+        .unwrap_or(if model_type == "olmo3" { 1e-5 } else { 1e-6 }) as f32;
     let layered = layered_config(&raw, num_hidden_layers, num_attention_heads, head_dim)?;
     // `rope_theta`, else a flat `rope_parameters`' (newer `transformers`
     // releases moved it there), else a layered decoder's sliding layers'.
@@ -739,7 +913,11 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
         .rope_theta
         .or(flat_rope_theta)
         .or(layered.as_ref().map(|layered| layered.rope_theta))
-        .unwrap_or(10_000.0);
+        .unwrap_or(if model_type == "smollm3" {
+            2_000_000.0
+        } else {
+            10_000.0
+        });
     if rope_theta <= 0.0 {
         return Err(ProductionIngestionError::MalformedMetadata {
             reason: "config.json's rope_theta must be positive".into(),
@@ -778,7 +956,15 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
         rope_theta,
         rope_scaling_factor,
         rope_frequency_scaling,
-        tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(false),
+        rope_layers,
+        hidden_activation: raw.hidden_act.clone().or_else(|| {
+            matches!(
+                model_type.as_str(),
+                "llama" | "qwen2" | "qwen2moe" | "qwen2_moe" | "mistral" | "olmo3" | "smollm3"
+            )
+            .then(|| "silu".to_string())
+        }),
+        tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(model_type == "smollm3"),
         // `config.json` never declares this for real Qwen2/2.5 checkpoints
         // (it's an architectural default of the model class, not a
         // config field) -- `false` here is a placeholder `lib.rs::ingest`
@@ -874,6 +1060,7 @@ mod tests {
     fn parses_a_real_qwen2_config() {
         let normalized = parse(&qwen2_0_5b_config()).expect("valid Qwen2 config parses");
         let config = normalized.architecture_config;
+        assert_eq!(config.hidden_activation.as_deref(), Some("silu"));
         assert_eq!(config.hidden_size, 896);
         assert_eq!(config.num_hidden_layers, 24);
         assert_eq!(config.num_attention_heads, 14);
@@ -885,6 +1072,228 @@ mod tests {
         assert_eq!(config.eos_token_id, Some(151645));
         assert_eq!(normalized.metadata.model_type, "qwen2");
         assert_eq!(normalized.metadata.torch_dtype.as_deref(), Some("bfloat16"));
+    }
+
+    #[test]
+    fn mistral_uniform_window_is_carried_to_every_layer() {
+        let mut value: serde_json::Value = serde_json::from_slice(&qwen2_0_5b_config()).unwrap();
+        value["model_type"] = "mistral".into();
+        value["num_hidden_layers"] = 3.into();
+        value["sliding_window"] = 4096.into();
+        let config = parse(&serde_json::to_vec(&value).unwrap())
+            .unwrap()
+            .architecture_config;
+        let layout = config.layer_layout.unwrap();
+        assert_eq!(layout.len(), 3);
+        for layer in layout {
+            assert_eq!(layer.sliding_window, Some(4096));
+            assert_eq!(layer.head_dim, config.head_dim);
+            assert_eq!(layer.num_key_value_heads, config.num_key_value_heads);
+            assert_eq!(layer.intermediate_size, config.intermediate_size);
+            assert_eq!(layer.rope_theta, config.rope_theta);
+        }
+    }
+
+    #[test]
+    fn mistral_missing_null_and_invalid_windows_are_distinguished() {
+        let mut value: serde_json::Value = serde_json::from_slice(&qwen2_0_5b_config()).unwrap();
+        value["model_type"] = "mistral".into();
+        let default = parse(&serde_json::to_vec(&value).unwrap())
+            .unwrap()
+            .architecture_config;
+        assert!(
+            default
+                .layer_layout
+                .unwrap()
+                .iter()
+                .all(|layer| layer.sliding_window == Some(4096))
+        );
+        value["sliding_window"] = serde_json::Value::Null;
+        assert!(
+            parse(&serde_json::to_vec(&value).unwrap())
+                .unwrap()
+                .architecture_config
+                .layer_layout
+                .is_none()
+        );
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("4096"),
+        ] {
+            value["sliding_window"] = invalid;
+            assert!(matches!(
+                parse(&serde_json::to_vec(&value).unwrap()),
+                Err(ProductionIngestionError::MalformedMetadata { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn explicit_mixed_layer_types_keep_their_windows() {
+        let mut value: serde_json::Value = serde_json::from_slice(&qwen2_0_5b_config()).unwrap();
+        value["model_type"] = "mistral".into();
+        value["num_hidden_layers"] = 2.into();
+        value["layer_types"] = serde_json::json!(["full_attention", "sliding_attention"]);
+        value["sliding_window"] = 64.into();
+        let config = parse(&serde_json::to_vec(&value).unwrap())
+            .unwrap()
+            .architecture_config;
+        let layout = config.layer_layout.unwrap();
+        assert_eq!(layout[0].sliding_window, None);
+        assert_eq!(layout[1].sliding_window, Some(64));
+    }
+
+    #[test]
+    fn olmo3_missing_layer_types_uses_upstream_attention_defaults() {
+        let mut value: serde_json::Value = serde_json::from_slice(&qwen2_0_5b_config()).unwrap();
+        value["model_type"] = "olmo3".into();
+        value["num_hidden_layers"] = 4.into();
+        let object = value.as_object_mut().unwrap();
+        object.remove("sliding_window");
+        object.remove("rope_theta");
+        let config = parse(&serde_json::to_vec(&value).unwrap())
+            .unwrap()
+            .architecture_config;
+        let layout = config.layer_layout.unwrap();
+        assert_eq!(
+            layout
+                .iter()
+                .map(|layer| layer.sliding_window)
+                .collect::<Vec<_>>(),
+            [Some(4096), Some(4096), Some(4096), None]
+        );
+        assert!(layout.iter().all(|layer| layer.rope_theta == 500_000.0));
+
+        value["sliding_window"] = serde_json::Value::Null;
+        assert!(matches!(
+            parse(&serde_json::to_vec(&value).unwrap()),
+            Err(ProductionIngestionError::MalformedMetadata { .. })
+        ));
+    }
+
+    #[test]
+    fn another_familys_window_is_not_assumed_to_be_enabled() {
+        let mut value: serde_json::Value = serde_json::from_slice(&qwen2_0_5b_config()).unwrap();
+        value["sliding_window"] = 4096.into();
+        value["use_sliding_window"] = false.into();
+        assert!(
+            parse(&serde_json::to_vec(&value).unwrap())
+                .unwrap()
+                .architecture_config
+                .layer_layout
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fixed_silu_components_reject_different_or_malformed_activations() {
+        for family in ["llama", "qwen2", "qwen2_moe", "mistral", "olmo3"] {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&qwen2_0_5b_config()).unwrap();
+            value["model_type"] = family.into();
+            // Absence means the upstream model class's SiLU default.
+            assert!(
+                parse(&serde_json::to_vec(&value).unwrap()).is_ok(),
+                "{family}"
+            );
+            value["hidden_act"] = "silu".into();
+            assert!(
+                parse(&serde_json::to_vec(&value).unwrap()).is_ok(),
+                "{family}"
+            );
+            for unsupported in ["gelu", "unknown", ""] {
+                value["hidden_act"] = unsupported.into();
+                assert!(
+                    matches!(
+                        parse(&serde_json::to_vec(&value).unwrap()),
+                        Err(ProductionIngestionError::UnsupportedFormat { .. })
+                    ),
+                    "{family} {unsupported:?}"
+                );
+            }
+            for malformed in [
+                serde_json::Value::Null,
+                serde_json::json!(42),
+                serde_json::json!(true),
+            ] {
+                value["hidden_act"] = malformed;
+                assert!(
+                    matches!(
+                        parse(&serde_json::to_vec(&value).unwrap()),
+                        Err(ProductionIngestionError::MalformedMetadata { .. })
+                    ),
+                    "{family}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn smollm3_preserves_explicit_and_default_rope_plans() {
+        let mut value: serde_json::Value = serde_json::from_slice(&qwen2_0_5b_config()).unwrap();
+        value["model_type"] = "smollm3".into();
+        value["no_rope_layers"] = serde_json::json!([1, 1, 1, 0]);
+        value["num_hidden_layers"] = 4.into();
+        let config = parse(&serde_json::to_vec(&value).unwrap())
+            .unwrap()
+            .architecture_config;
+        assert_eq!(config.rope_layers, Some(vec![true, true, true, false]));
+
+        value.as_object_mut().unwrap().remove("no_rope_layers");
+        value["num_hidden_layers"] = 5.into();
+        let config = parse(&serde_json::to_vec(&value).unwrap())
+            .unwrap()
+            .architecture_config;
+        assert_eq!(
+            config.rope_layers,
+            Some(vec![true, true, true, false, true])
+        );
+        value["no_rope_layer_interval"] = 2.into();
+        let config = parse(&serde_json::to_vec(&value).unwrap())
+            .unwrap()
+            .architecture_config;
+        assert_eq!(
+            config.rope_layers,
+            Some(vec![true, false, true, false, true])
+        );
+    }
+
+    #[test]
+    fn smollm3_rejects_invalid_position_plans_and_unsupported_features() {
+        let mut value: serde_json::Value = serde_json::from_slice(&qwen2_0_5b_config()).unwrap();
+        value["model_type"] = "smollm3".into();
+        value["num_hidden_layers"] = 2.into();
+        for mask in [
+            serde_json::json!([1]),
+            serde_json::json!([1, 2]),
+            serde_json::json!([1, true]),
+        ] {
+            value["no_rope_layers"] = mask;
+            assert!(parse(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+        value.as_object_mut().unwrap().remove("no_rope_layers");
+        value["no_rope_layer_interval"] = 0.into();
+        assert!(parse(&serde_json::to_vec(&value).unwrap()).is_err());
+        value["no_rope_layer_interval"] = serde_json::Value::Null;
+        assert!(parse(&serde_json::to_vec(&value).unwrap()).is_err());
+        value["no_rope_layer_interval"] = 4.into();
+        for (name, unsupported) in [
+            ("use_sliding_window", serde_json::json!(true)),
+            ("mlp_bias", serde_json::json!(true)),
+            (
+                "layer_types",
+                serde_json::json!(["full_attention", "sliding_attention"]),
+            ),
+        ] {
+            value[name] = unsupported;
+            assert!(matches!(
+                parse(&serde_json::to_vec(&value).unwrap()),
+                Err(ProductionIngestionError::UnsupportedFormat { .. })
+            ));
+            value.as_object_mut().unwrap().remove(name);
+        }
     }
 
     /// Llama 3.2 1B Instruct's real `config.json` (rope and shape fields).
