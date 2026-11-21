@@ -310,7 +310,8 @@ fn latent_attention(
         qk_nope_head_dim: field(raw.qk_nope_head_dim, "qk_nope_head_dim")?,
         qk_rope_head_dim: field(raw.qk_rope_head_dim, "qk_rope_head_dim")?,
         v_head_dim: field(raw.v_head_dim, "v_head_dim")?,
-        norm_eps: (raw.model_type.as_deref() == Some("glm4_moe_lite")).then_some(1e-6),
+        norm_eps: matches!(raw.model_type.as_deref(), Some("glm4_moe_lite" | "kimi_k2"))
+            .then_some(1e-6),
     }))
 }
 
@@ -335,6 +336,25 @@ fn routed_experts(
         return Ok(None);
     };
     let glm = raw.model_type.as_deref() == Some("glm4_moe_lite");
+    let kimi = raw.model_type.as_deref() == Some("kimi_k2");
+    if kimi
+        && (raw.scoring_func.as_deref() != Some("sigmoid")
+            || raw.topk_method.as_deref() != Some("noaux_tc")
+            || raw.norm_topk_prob.is_none()
+            || raw.routed_scaling_factor.is_none()
+            || raw.n_group.is_none()
+            || raw.topk_group.is_none()
+            || raw.n_group != raw.topk_group)
+    {
+        // Kimi's original router masks unselected groups to zero rather
+        // than negative infinity. The shared graph is equivalent when all
+        // groups are selected (as in the pinned checkpoint); other layouts
+        // need a separately qualified masking mode.
+        return Err(ProductionIngestionError::UnsupportedFormat {
+            reason: "Kimi routing requires explicit sigmoid/noaux settings and all groups selected"
+                .into(),
+        });
+    }
     let malformed = |reason: String| ProductionIngestionError::MalformedMetadata { reason };
     let experts_per_token = raw.num_experts_per_tok.ok_or_else(|| {
         malformed("config.json declares routed experts but no 'num_experts_per_tok'".into())
@@ -450,11 +470,21 @@ fn routed_experts(
             .routed_scaling_factor
             .unwrap_or(if glm { 1.8 } else { 1.0 }),
         selection_bias,
-        normalization: glm.then_some(if moe.normalize_top_k {
-            ExpertNormalization::Always
+        normalization: if glm {
+            Some(if moe.normalize_top_k {
+                ExpertNormalization::Always
+            } else {
+                ExpertNormalization::Never
+            })
+        } else if kimi {
+            Some(if moe.normalize_top_k {
+                ExpertNormalization::MultipleExperts
+            } else {
+                ExpertNormalization::Never
+            })
         } else {
-            ExpertNormalization::Never
-        }),
+            None
+        },
         shared_expert_gated: false,
     };
     Ok(Some((moe, moe_layers, routing)))
@@ -872,6 +902,7 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
             | "deepseek_v3"
             | "deepseek2"
             | "glm4_moe_lite"
+            | "kimi_k2"
     );
     let hidden_activation = raw
         .hidden_activation
@@ -1972,6 +2003,38 @@ mod latent_attention_tests {
         raw.as_object_mut().unwrap().remove("rope_interleave");
         raw["mlp_layer_types"] = serde_json::json!(["dense"]);
         assert!(parse(&serde_json::to_vec(&raw).unwrap()).is_err());
+    }
+
+    #[test]
+    fn pinned_kimi_config_keeps_its_fp8_and_distinct_top_one_rules() {
+        let path = format!(
+            "{}/testdata/kimi-k2/config.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let bytes = std::fs::read(path).unwrap();
+        let parsed = parse(&bytes).unwrap();
+        assert_eq!(parsed.metadata.model_type, "kimi_k2");
+        assert_eq!(
+            parsed.fp8,
+            Some(crate::fp8::CheckpointBlockSpecV1 {
+                block_rows: 128,
+                block_columns: 128
+            })
+        );
+        let config = parsed.architecture_config;
+        assert_eq!(config.latent_attention.unwrap().norm_eps, Some(1e-6));
+        assert_eq!(
+            config.expert_routing.unwrap().normalization,
+            Some(ExpertNormalization::MultipleExperts)
+        );
+        assert_eq!(config.expert_routing.unwrap().groups.unwrap().count, 1);
+        assert_eq!(config.mixture_of_experts.unwrap().experts, 384);
+        let mut changed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        changed["n_group"] = serde_json::json!(2);
+        assert!(parse(&serde_json::to_vec(&changed).unwrap()).is_err());
+        changed["n_group"] = serde_json::json!(1);
+        changed.as_object_mut().unwrap().remove("scoring_func");
+        assert!(parse(&serde_json::to_vec(&changed).unwrap()).is_err());
     }
 
     fn yarn(config: &ModelArchitectureConfig) -> (RopeYarnFrequencyScaling, Option<f64>) {

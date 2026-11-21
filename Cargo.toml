@@ -34,4 +34,5 @@ tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 minijinja = { version = "3", default-features = false, features = ["builtins", "serde"] }
 
 [dev-dependencies]
+flate2 = "1"
 tempfile = "3"

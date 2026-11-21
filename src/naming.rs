@@ -92,6 +92,15 @@ pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionErr
             "router.per_expert_scale" => Some("moe.per_expert_scale"),
             // A sigmoid router's selection-only bias per expert.
             "mlp.gate.e_score_correction_bias" => Some("moe.selection_bias"),
+            // Olala's learned scalar residual parameters and its separately
+            // stored buffer have no `.weight` suffix. Keep mixer and MLP
+            // identities distinct, including for nonzero layer indices.
+            "geodesic_mixer.scale"
+            | "geodesic_mixer.bias"
+            | "geodesic_mixer.prosres_scalar"
+            | "geodesic_mlp.scale"
+            | "geodesic_mlp.bias"
+            | "geodesic_mlp.prosres_scalar" => Some(field),
             _ => None,
         };
         if let Some(canonical) = canonical {

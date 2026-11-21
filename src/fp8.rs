@@ -78,6 +78,14 @@ pub struct BlockLayout {
     pub block_columns: usize,
 }
 
+/// Version 1 metadata for one E4M3FN weight's row-major block scales.
+/// The named F32 tensor has one entry per (possibly partial) block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockScaleMetadataV1 {
+    pub scale_tensor: String,
+    pub layout: BlockLayout,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Fp8ConversionError {
     EmptyDimension,
@@ -171,7 +179,7 @@ pub(crate) struct Projection {
     scale: ProductionPayloadRange,
     output_offset: u64,
     output_length: u64,
-    layout: BlockLayout,
+    block_scale: BlockScaleMetadataV1,
 }
 
 fn range(tensor: &ModelTensorMetadata) -> Result<ProductionPayloadRange, ProductionIngestionError> {
@@ -315,7 +323,10 @@ pub(crate) fn extract_projections(
             scale: scale_range,
             output_offset,
             output_length,
-            layout,
+            block_scale: BlockScaleMetadataV1 {
+                scale_tensor: scale_name.clone(),
+                layout,
+            },
         });
         used_scales.insert(scale_name);
         output_lengths.insert(weight.name, output_length);
@@ -417,11 +428,14 @@ impl<S: ProductionArtifactPayloadSource> ProductionArtifactPayloadSource
             }
         })?;
         scales.extend(chunks.iter().copied().map(f32::from_le_bytes));
-        let values = dequantize_blocks(&weight, &scales, projection.layout).map_err(|error| {
-            ProductionIngestionError::MalformedMetadata {
-                reason: format!("FP8 conversion of '{}' failed: {error}", requested.identity),
-            }
-        })?;
+        let values = dequantize_blocks(&weight, &scales, projection.block_scale.layout).map_err(
+            |error| ProductionIngestionError::MalformedMetadata {
+                reason: format!(
+                    "FP8 conversion of '{}' using '{}' failed: {error}",
+                    requested.identity, projection.block_scale.scale_tensor
+                ),
+            },
+        )?;
         let output_length = usize::try_from(projection.output_length).map_err(|_| {
             ProductionIngestionError::MalformedMetadata {
                 reason: format!("FP8 output '{}' is too large", requested.identity),
