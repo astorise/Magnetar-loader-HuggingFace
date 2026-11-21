@@ -4,8 +4,9 @@
 //! task group 3, Decision 5).
 
 use magnetar_runtime::model::{
-    ExpertGroupScore, ExpertGroups, ExpertRoutingConfig, ExpertScoring, LatentAttentionConfig,
-    LayerSpec, MixtureOfExpertsConfig, ModelArchitectureConfig, RopeFrequencyScaling,
+    ExpertGroupScore, ExpertGroups, ExpertNormalization, ExpertRoutingConfig, ExpertScoring,
+    LatentAttentionConfig, LayerSpec, MixtureOfExpertsConfig, ModelArchitectureConfig,
+    RopeFrequencyScaling,
 };
 use magnetar_runtime::model_format_roadmap::{HfConfigMetadata, HfRopeMetadata};
 use magnetar_runtime::operator::{RopeBandedFrequencyScaling, RopeYarnFrequencyScaling};
@@ -130,6 +131,9 @@ struct RawHfConfig {
     first_k_dense_replace: Option<u32>,
     #[serde(default)]
     moe_layer_freq: Option<u32>,
+    /// Explicit sparse/dense MLP pattern used by newer GLM configs.
+    #[serde(default)]
+    mlp_layer_types: Option<Vec<String>>,
     /// `greedy`, `group_limited_greedy` (groups by their best expert) or
     /// `noaux_tc` (groups by their two best, with a selection bias).
     #[serde(default)]
@@ -327,6 +331,7 @@ fn routed_experts(
     let Some(experts) = raw.n_routed_experts else {
         return Ok(None);
     };
+    let glm = raw.model_type.as_deref() == Some("glm4_moe_lite");
     let malformed = |reason: String| ProductionIngestionError::MalformedMetadata { reason };
     let experts_per_token = raw.num_experts_per_tok.ok_or_else(|| {
         malformed("config.json declares routed experts but no 'num_experts_per_tok'".into())
@@ -342,16 +347,46 @@ fn routed_experts(
             .n_shared_experts
             .filter(|count| *count > 0)
             .map(|count| count * expert_intermediate_size),
-        normalize_top_k: raw.norm_topk_prob.unwrap_or(false),
+        normalize_top_k: raw.norm_topk_prob.unwrap_or(glm),
     };
-    let first_moe = raw.first_k_dense_replace.unwrap_or(0);
+    let first_moe = raw.first_k_dense_replace.unwrap_or(u32::from(glm));
     let frequency = raw.moe_layer_freq.unwrap_or(1).max(1);
-    let routed: Vec<bool> = (0..layers)
+    let mut routed: Vec<bool> = (0..layers)
         .map(|layer| layer >= first_moe && layer % frequency == 0)
         .collect();
+    if glm && let Some(types) = &raw.mlp_layer_types {
+        if types.len() != layers as usize {
+            return Err(malformed(
+                "GLM mlp_layer_types must have one entry per layer".into(),
+            ));
+        }
+        let explicit = types
+            .iter()
+            .map(|kind| match kind.as_str() {
+                "dense" => Ok(false),
+                "sparse" => Ok(true),
+                _ => Err(malformed(format!(
+                    "unsupported GLM MLP layer type '{kind}'"
+                ))),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if (raw.first_k_dense_replace.is_some() || raw.moe_layer_freq.is_some())
+            && explicit != routed
+        {
+            return Err(malformed("GLM MLP layer declarations disagree".into()));
+        }
+        routed = explicit;
+    }
     let moe_layers = (!routed.iter().all(|routed| *routed)).then_some(routed);
     let scoring = match raw.scoring_func.as_deref() {
-        None | Some("softmax") => ExpertScoring::Softmax,
+        None => {
+            if glm {
+                ExpertScoring::Sigmoid
+            } else {
+                ExpertScoring::Softmax
+            }
+        }
+        Some("softmax") if !glm => ExpertScoring::Softmax,
         Some("sigmoid") => ExpertScoring::Sigmoid,
         Some(other) => {
             return Err(ProductionIngestionError::UnsupportedFormat {
@@ -360,10 +395,10 @@ fn routed_experts(
         }
     };
     let grouped = |score| -> Result<Option<ExpertGroups>, ProductionIngestionError> {
-        let count = raw.n_group.ok_or_else(|| {
+        let count = raw.n_group.or(glm.then_some(1)).ok_or_else(|| {
             malformed("config.json's group-limited routing has no 'n_group'".into())
         })?;
-        let per_token = raw.topk_group.ok_or_else(|| {
+        let per_token = raw.topk_group.or(glm.then_some(1)).ok_or_else(|| {
             malformed("config.json's group-limited routing has no 'topk_group'".into())
         })?;
         Ok(Some(ExpertGroups {
@@ -373,8 +408,15 @@ fn routed_experts(
         }))
     };
     let (groups, selection_bias) = match raw.topk_method.as_deref() {
-        None | Some("greedy") => (None, false),
-        Some("group_limited_greedy") => (grouped(ExpertGroupScore::Max)?, false),
+        None => {
+            if glm {
+                (grouped(ExpertGroupScore::TopTwoSum)?, true)
+            } else {
+                (None, false)
+            }
+        }
+        Some("greedy") if !glm => (None, false),
+        Some("group_limited_greedy") if !glm => (grouped(ExpertGroupScore::Max)?, false),
         Some("noaux_tc") => (grouped(ExpertGroupScore::TopTwoSum)?, true),
         Some(other) => {
             return Err(ProductionIngestionError::UnsupportedFormat {
@@ -401,8 +443,15 @@ fn routed_experts(
     let routing = ExpertRoutingConfig {
         scoring,
         groups,
-        routed_scaling_factor: raw.routed_scaling_factor.unwrap_or(1.0),
+        routed_scaling_factor: raw
+            .routed_scaling_factor
+            .unwrap_or(if glm { 1.8 } else { 1.0 }),
         selection_bias,
+        normalization: glm.then_some(if moe.normalize_top_k {
+            ExpertNormalization::Always
+        } else {
+            ExpertNormalization::Never
+        }),
         shared_expert_gated: false,
     };
     Ok(Some((moe, moe_layers, routing)))
@@ -814,6 +863,7 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
             | "deepseek_v2"
             | "deepseek_v3"
             | "deepseek2"
+            | "glm4_moe_lite"
     );
     let hidden_activation = raw
         .hidden_activation
@@ -955,9 +1005,13 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
         });
     }
 
-    let rms_norm_eps = raw
-        .rms_norm_eps
-        .unwrap_or(if model_type == "olmo3" { 1e-5 } else { 1e-6 }) as f32;
+    let rms_norm_eps = raw.rms_norm_eps.unwrap_or(
+        if matches!(model_type.as_str(), "olmo3" | "glm4_moe_lite") {
+            1e-5
+        } else {
+            1e-6
+        },
+    ) as f32;
     let layered = layered_config(&raw, num_hidden_layers, num_attention_heads, head_dim)?;
     // `rope_theta`, else a flat `rope_parameters`' (newer `transformers`
     // releases moved it there), else a layered decoder's sliding layers'.
@@ -1848,6 +1902,66 @@ mod latent_attention_tests {
         parse(&std::fs::read(path).unwrap()).unwrap()
     }
 
+    #[test]
+    fn glm_flash_defaults_to_grouped_sigmoid_and_top_one_normalization() {
+        // Published GLM-4.7-Flash config: scoring_func is intentionally absent.
+        let path = format!(
+            "{}/testdata/glm/glm-4.7-flash.config.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let parse_raw = |raw: &serde_json::Value| {
+            parse(&serde_json::to_vec(raw).unwrap())
+                .unwrap()
+                .architecture_config
+        };
+        let config = parse_raw(&raw);
+        let routing = config.expert_routing.unwrap();
+        assert_eq!(routing.scoring, ExpertScoring::Sigmoid);
+        assert_eq!(
+            routing.groups,
+            Some(ExpertGroups {
+                count: 1,
+                per_token: 1,
+                score: ExpertGroupScore::TopTwoSum
+            })
+        );
+        assert!(routing.selection_bias);
+        assert_eq!(routing.normalization, Some(ExpertNormalization::Always));
+        assert_eq!(routing.routed_scaling_factor, 1.8);
+        let layers = config.moe_layers.unwrap();
+        assert_eq!(layers.len(), 47);
+        assert!(!layers[0] && layers[1..].iter().all(|value| *value));
+
+        // These are class defaults even when omitted from a serialized config.
+        let object = raw.as_object_mut().unwrap();
+        for key in [
+            "norm_topk_prob",
+            "topk_method",
+            "n_group",
+            "topk_group",
+            "first_k_dense_replace",
+            "routed_scaling_factor",
+        ] {
+            object.remove(key);
+        }
+        let defaulted = parse_raw(&raw);
+        assert_eq!(defaulted.expert_routing.unwrap(), routing);
+        assert_eq!(defaulted.moe_layers.unwrap(), layers);
+
+        raw["norm_topk_prob"] = serde_json::json!(false);
+        assert_eq!(
+            parse_raw(&raw).expert_routing.unwrap().normalization,
+            Some(ExpertNormalization::Never)
+        );
+        raw["scoring_func"] = serde_json::json!("softmax");
+        assert!(parse(&serde_json::to_vec(&raw).unwrap()).is_err());
+        raw.as_object_mut().unwrap().remove("scoring_func");
+        raw["mlp_layer_types"] = serde_json::json!(["dense"]);
+        assert!(parse(&serde_json::to_vec(&raw).unwrap()).is_err());
+    }
+
     fn yarn(config: &ModelArchitectureConfig) -> (RopeYarnFrequencyScaling, Option<f64>) {
         match config.rope_frequency_scaling {
             Some(RopeFrequencyScaling::Yarn {
@@ -1896,6 +2010,7 @@ mod latent_attention_tests {
                 groups: None,
                 routed_scaling_factor: 1.0,
                 selection_bias: false,
+                normalization: None,
                 shared_expert_gated: false,
             })
         );
@@ -1925,6 +2040,7 @@ mod latent_attention_tests {
                 }),
                 routed_scaling_factor: 16.0,
                 selection_bias: false,
+                normalization: None,
                 shared_expert_gated: false,
             })
         );
@@ -1996,6 +2112,7 @@ mod latent_attention_tests {
                 }),
                 routed_scaling_factor: 2.5,
                 selection_bias: true,
+                normalization: None,
                 shared_expert_gated: false,
             })
         );
