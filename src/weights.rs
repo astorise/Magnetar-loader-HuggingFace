@@ -246,7 +246,7 @@ fn parse_shard_file(
 
 /// Either a plain Safetensors payload source, or one wrapping it to
 /// dequantize GPTQ-quantized (`gptq.rs`), AWQ-quantized (`awq.rs`), or
-/// BitsAndBytes-quantized (`bnb.rs`) projections on demand -- the one
+/// BitsAndBytes-quantized (`bnb.rs`) or block-FP8 (`fp8.rs`) projections on demand -- the one
 /// caller (`discover_and_parse_weights`) picks the variant, so every
 /// other caller (`lib.rs::ingest`) just sees one
 /// [`ProductionArtifactPayloadSource`] regardless of which real bundle
@@ -260,6 +260,7 @@ pub enum WeightsPayloadSource {
     Gptq(crate::gptq::GptqDequantizingPayloadSource<SafetensorsPayloadSource>),
     Awq(crate::awq::AwqDequantizingPayloadSource<SafetensorsPayloadSource>),
     Bnb(crate::bnb::BnbDequantizingPayloadSource<SafetensorsPayloadSource>),
+    Fp8(crate::fp8::DequantizingPayloadSource<SafetensorsPayloadSource>),
 }
 
 impl WeightsPayloadSource {
@@ -271,6 +272,7 @@ impl WeightsPayloadSource {
             Self::Gptq(source) => source.inner(),
             Self::Awq(source) => source.inner(),
             Self::Bnb(source) => source.inner(),
+            Self::Fp8(source) => source.inner(),
         }
     }
 
@@ -282,6 +284,23 @@ impl WeightsPayloadSource {
             Self::Gptq(source) => source.dequantizes(identity),
             Self::Awq(source) => source.dequantizes(identity),
             Self::Bnb(source) => source.dequantizes(identity),
+            Self::Fp8(source) => source.dequantizes(identity),
+        }
+    }
+
+    /// FP8 conversion preserves the stored matrix orientation, unlike some
+    /// other quantizers; its converted bytes can be safely sliced or stacked.
+    pub(crate) fn is_fp8_projection(&self, identity: &str) -> bool {
+        matches!(self, Self::Fp8(source) if source.dequantizes(identity))
+    }
+
+    pub(crate) fn read_fp8_projection(
+        &self,
+        identity: &str,
+    ) -> Result<Option<Vec<u8>>, ProductionIngestionError> {
+        match self {
+            Self::Fp8(source) => source.read_projection(identity),
+            _ => Ok(None),
         }
     }
 }
@@ -296,6 +315,7 @@ impl ProductionArtifactPayloadSource for WeightsPayloadSource {
             Self::Gptq(source) => source.read_payload(range),
             Self::Awq(source) => source.read_payload(range),
             Self::Bnb(source) => source.read_payload(range),
+            Self::Fp8(source) => source.read_payload(range),
         }
     }
 }
@@ -316,8 +336,16 @@ pub type DiscoveredWeights = (
 /// Discovers and parses this bundle's weight files -- single-file
 /// `model.safetensors` if present, else Hugging Face-style sharded
 /// `model.safetensors.index.json` plus `model-*-of-*.safetensors` shards.
+#[cfg(test)]
 pub fn discover_and_parse_weights(
     source: &ProductionModelSource,
+) -> Result<DiscoveredWeights, ProductionIngestionError> {
+    discover_and_parse_weights_with_fp8(source, None)
+}
+
+pub fn discover_and_parse_weights_with_fp8(
+    source: &ProductionModelSource,
+    fp8_spec: Option<crate::fp8::CheckpointBlockSpecV1>,
 ) -> Result<DiscoveredWeights, ProductionIngestionError> {
     let (mut tensors, shards, mut payload_source) =
         if let Ok(index_path) = source.resolve(INDEX_FILE_NAME) {
@@ -329,18 +357,6 @@ pub fn discover_and_parse_weights(
                 part: format!("{SINGLE_FILE_NAME} or {INDEX_FILE_NAME}"),
             });
         };
-
-    // The format parser recognizes E4M3FN as a distinct byte dtype, but
-    // production ingestion must not admit it until the matching block
-    // scales and quantization configuration are associated and validated.
-    if tensors
-        .iter()
-        .any(|tensor| tensor.storage_dtype == magnetar_runtime::model::ModelDType::F8E4M3Fn)
-    {
-        return Err(ProductionIngestionError::UnsupportedFormat {
-            reason: "block-scaled FP8 weight ingestion is not yet connected".into(),
-        });
-    }
 
     // GPTQ-quantized projections replace their raw `.qweight`/`.qzeros`/
     // `.scales`/`.g_idx` quadruple with one synthesized `<prefix>.weight`
@@ -358,6 +374,16 @@ pub fn discover_and_parse_weights(
     // run here too, while `payload_source` still holds every tensor's
     // real raw-named location, before the renaming loop below.
     let bnb_projections = crate::bnb::extract_bnb_projections(&mut tensors, &payload_source)?;
+    let fp8_projections = crate::fp8::extract_projections(&mut tensors, fp8_spec)?;
+    if !fp8_projections.is_empty()
+        && (!gptq_projections.is_empty()
+            || !awq_projections.is_empty()
+            || !bnb_projections.is_empty())
+    {
+        return Err(ProductionIngestionError::UnsupportedFormat {
+            reason: "mixing FP8 with other quantization methods is not supported".into(),
+        });
+    }
 
     // Real Hugging Face tensor names (e.g. "model.layers.0.self_attn.
     // q_proj.weight") are normalized into the canonical Model Artifact
@@ -432,6 +458,11 @@ pub fn discover_and_parse_weights(
         WeightsPayloadSource::Bnb(crate::bnb::BnbDequantizingPayloadSource::new(
             payload_source,
             bnb_projections,
+        ))
+    } else if !fp8_projections.is_empty() {
+        WeightsPayloadSource::Fp8(crate::fp8::DequantizingPayloadSource::new(
+            payload_source,
+            fp8_projections,
         ))
     } else {
         WeightsPayloadSource::Plain(payload_source)
@@ -609,7 +640,7 @@ fn discover_sharded(
 mod tests {
     use super::*;
     use magnetar_runtime::ModelArtifactSource;
-    use std::io::Write;
+    use std::io::{Seek, SeekFrom, Write};
 
     fn write_safetensors_file(path: &std::path::Path, tensors: &[(&str, &[f32])]) {
         let mut header = serde_json::Map::new();
@@ -638,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn fp8_is_rejected_until_block_scales_are_connected() {
+    fn fp8_without_a_declared_configuration_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let header = br#"{"model.layers.0.mlp.up_proj.weight":{"dtype":"F8_E4M3","shape":[1,1],"data_offsets":[0,1]}}"#;
         let mut file = fs::File::create(dir.path().join(SINGLE_FILE_NAME)).unwrap();
@@ -653,6 +684,105 @@ mod tests {
         assert!(matches!(
             discover_and_parse_weights(&source),
             Err(ProductionIngestionError::UnsupportedFormat { .. })
+        ));
+    }
+
+    fn write_raw_tensor(
+        path: &std::path::Path,
+        name: &str,
+        dtype: &str,
+        shape: &[u64],
+        data: &[u8],
+    ) {
+        let header = serde_json::to_vec(&serde_json::json!({
+            name: {"dtype": dtype, "shape": shape, "data_offsets": [0, data.len()]}
+        }))
+        .unwrap();
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header).unwrap();
+        file.write_all(data).unwrap();
+    }
+
+    #[test]
+    fn fp8_weight_reads_its_scale_from_a_different_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let weight_name = "model.layers.0.mlp.up_proj.weight";
+        let scale_name = "model.layers.0.mlp.up_proj.weight_scale_inv";
+        write_raw_tensor(
+            &dir.path().join("weight.safetensors"),
+            weight_name,
+            "F8_E4M3",
+            &[2, 3],
+            &[0x38, 0x40, 0x44, 0x48, 0x4a, 0x4c],
+        );
+        let scale_bytes: Vec<u8> = [0.5_f32, 2.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        write_raw_tensor(
+            &dir.path().join("scale.safetensors"),
+            scale_name,
+            "F32",
+            &[1, 2],
+            &scale_bytes,
+        );
+        fs::write(
+            dir.path().join(INDEX_FILE_NAME),
+            serde_json::to_vec(&serde_json::json!({"weight_map": {
+                weight_name: "weight.safetensors", scale_name: "scale.safetensors"
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        let spec = Some(crate::fp8::CheckpointBlockSpecV1 {
+            block_rows: 2,
+            block_columns: 2,
+        });
+        let (tensors, shards, _, payload) =
+            discover_and_parse_weights_with_fp8(&source, spec).unwrap();
+        assert_eq!(shards.len(), 2);
+        assert_eq!(tensors.len(), 1);
+        let tensor = &tensors[0];
+        assert_eq!(tensor.name, "layers.0.mlp.up_proj");
+        assert_eq!(
+            tensor.storage_dtype,
+            magnetar_runtime::model::ModelDType::F32
+        );
+        let bytes = payload
+            .read_payload(&ProductionPayloadRange {
+                identity: tensor.name.clone(),
+                offset: tensor.offset_bytes.unwrap(),
+                length: tensor.size_bytes.unwrap(),
+                digest: None,
+            })
+            .unwrap();
+        let (chunks, remainder) = bytes.as_chunks::<4>();
+        assert!(remainder.is_empty());
+        let actual: Vec<f32> = chunks.iter().copied().map(f32::from_le_bytes).collect();
+        assert_eq!(actual, vec![0.5, 1.0, 6.0, 2.0, 2.5, 12.0]);
+        let mut stored = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("weight.safetensors"))
+            .unwrap();
+        stored.seek(SeekFrom::End(-1)).unwrap();
+        stored.write_all(&[0x00]).unwrap();
+        let error = payload
+            .read_payload(&ProductionPayloadRange {
+                identity: tensor.name.clone(),
+                offset: tensor.offset_bytes.unwrap(),
+                length: tensor.size_bytes.unwrap(),
+                digest: None,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProductionIngestionError::IntegrityMismatch { .. }
         ));
     }
 

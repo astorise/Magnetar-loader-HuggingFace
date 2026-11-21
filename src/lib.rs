@@ -134,7 +134,7 @@ impl ProductionModelArtifactIngestor for HuggingFaceIngestor {
         let mut normalized_config = config::parse(&config_bytes)?;
 
         let (mut tensors, shards, quantized_projection_names, payload_source) =
-            weights::discover_and_parse_weights(source)?;
+            weights::discover_and_parse_weights_with_fp8(source, normalized_config.fp8)?;
         if tensors.is_empty() {
             return Err(ProductionIngestionError::MalformedMetadata {
                 reason: "no tensors were discovered in this bundle's weight files".into(),

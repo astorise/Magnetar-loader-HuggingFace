@@ -44,7 +44,7 @@ use magnetar_runtime::production_model_ingestion::{
     ProductionArtifactPayloadSource, ProductionIngestionError, ProductionPayloadRange,
 };
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const CODEBOOK_SIZE: usize = 16;
 
@@ -295,13 +295,12 @@ pub fn extract_bnb_projections(
     tensors: &mut Vec<ModelTensorMetadata>,
     payload_source: &dyn ProductionArtifactPayloadSource,
 ) -> Result<Vec<BnbProjection>, ProductionIngestionError> {
+    let names: BTreeSet<&str> = tensors.iter().map(|tensor| tensor.name.as_str()).collect();
     let weight_names: Vec<String> = tensors
         .iter()
         .filter(|tensor| {
             tensor.name.ends_with(".weight")
-                && tensors
-                    .iter()
-                    .any(|other| other.name == format!("{}.absmax", tensor.name))
+                && names.contains(format!("{}.absmax", tensor.name).as_str())
         })
         .map(|tensor| tensor.name.clone())
         .collect();

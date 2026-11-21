@@ -438,6 +438,8 @@ impl RawEosTokenId {
 pub struct NormalizedHfConfig {
     pub architecture_config: ModelArchitectureConfig,
     pub metadata: HfConfigMetadata,
+    /// The supported block FP8 checkpoint convention, when declared.
+    pub fp8: Option<crate::fp8::CheckpointBlockSpecV1>,
 }
 
 fn required<T>(value: Option<T>, field: &str) -> Result<T, ProductionIngestionError> {
@@ -697,6 +699,11 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
         reason: format!("config.json is not valid JSON matching the expected shape: {error}"),
     };
     let value: serde_json::Value = serde_json::from_slice(bytes).map_err(shape_error)?;
+    let fp8 = crate::fp8::checkpoint_spec(value.get("quantization_config").or_else(|| {
+        value
+            .get("text_config")
+            .and_then(|text| text.get("quantization_config"))
+    }))?;
     // A multimodal bundle nests its text decoder's configuration under
     // `text_config`; the bundle's own `model_type` and `architectures` name
     // the checkpoint.
@@ -1070,6 +1077,7 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
     Ok(NormalizedHfConfig {
         architecture_config,
         metadata,
+        fp8,
     })
 }
 
@@ -1959,6 +1967,13 @@ mod latent_attention_tests {
     fn deepseek_v3_scores_with_a_sigmoid_and_a_selection_bias() {
         let parsed = parse_deepseek("DeepSeek-V3");
         assert_eq!(parsed.metadata.model_type, "deepseek_v3");
+        assert_eq!(
+            parsed.fp8,
+            Some(crate::fp8::CheckpointBlockSpecV1 {
+                block_rows: 128,
+                block_columns: 128,
+            })
+        );
         let config = parsed.architecture_config;
         let layers = config.moe_layers.as_ref().unwrap();
         assert!(

@@ -13,6 +13,37 @@ fn reference() -> Reference {
     serde_json::from_slice(include_bytes!("../../testdata/fp8/e4m3fn-reference.json")).unwrap()
 }
 
+#[test]
+fn checkpoint_block_metadata_is_explicit_and_validated() {
+    let mut config = serde_json::json!({
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128]
+    });
+    assert_eq!(
+        checkpoint_spec(Some(&config)).unwrap(),
+        Some(CheckpointBlockSpecV1 {
+            block_rows: 128,
+            block_columns: 128,
+        })
+    );
+    for invalid in [
+        serde_json::json!([128]),
+        serde_json::json!([0, 128]),
+        serde_json::json!([128, -1]),
+    ] {
+        config["weight_block_size"] = invalid;
+        assert!(checkpoint_spec(Some(&config)).is_err());
+    }
+    config["weight_block_size"] = serde_json::json!([128, 128]);
+    config["fmt"] = "e5m2".into();
+    assert!(checkpoint_spec(Some(&config)).is_err());
+    config["fmt"] = "e4m3".into();
+    config["activation_scheme"] = "static".into();
+    assert!(checkpoint_spec(Some(&config)).is_err());
+}
+
 fn check_bits(actual: f32, expected: Option<u32>) {
     match expected {
         Some(bits) => assert_eq!(actual.to_bits(), bits),
@@ -89,4 +120,59 @@ fn invalid_geometry_and_scales_fail_closed() {
         ),
         Err(Fp8ConversionError::SizeOverflow)
     );
+}
+
+#[test]
+fn projection_association_rejects_missing_or_incompatible_scales() {
+    let tensor = |name: &str, dtype: ModelDType, shape: Vec<u64>, length| ModelTensorMetadata {
+        name: name.into(),
+        shape,
+        storage_dtype: dtype,
+        layout: None,
+        shard: None,
+        offset_bytes: Some(0),
+        size_bytes: Some(length),
+        quantization: None,
+        expected_compute_dtype: None,
+        digest: None,
+    };
+    let weight = tensor(
+        "model.layers.0.mlp.up_proj.weight",
+        ModelDType::F8E4M3Fn,
+        vec![3, 5],
+        15,
+    );
+    let scale = tensor(
+        "model.layers.0.mlp.up_proj.weight_scale_inv",
+        ModelDType::F32,
+        vec![2, 3],
+        24,
+    );
+    let spec = Some(CheckpointBlockSpecV1 {
+        block_rows: 2,
+        block_columns: 2,
+    });
+    assert!(extract_projections(&mut vec![weight.clone()], spec).is_err());
+    assert!(extract_projections(&mut vec![weight.clone(), scale.clone()], None).is_err());
+    for invalid in [
+        ModelTensorMetadata {
+            storage_dtype: ModelDType::Bf16,
+            ..scale.clone()
+        },
+        ModelTensorMetadata {
+            shape: vec![2, 2],
+            ..scale.clone()
+        },
+        ModelTensorMetadata {
+            size_bytes: Some(20),
+            ..scale.clone()
+        },
+    ] {
+        assert!(extract_projections(&mut vec![weight.clone(), invalid], spec).is_err());
+    }
+    let mut valid = vec![weight, scale];
+    assert_eq!(extract_projections(&mut valid, spec).unwrap().len(), 1);
+    assert_eq!(valid.len(), 1);
+    assert_eq!(valid[0].storage_dtype, ModelDType::F32);
+    assert_eq!(valid[0].size_bytes, Some(60));
 }
