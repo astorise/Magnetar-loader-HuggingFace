@@ -738,9 +738,9 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
         }
         if raw.layer_types.is_none() {
             if num_hidden_layers > 4096 {
-                return Err(malformed(
-                    "config.json declares too many decoder layers".into(),
-                ));
+                return Err(ProductionIngestionError::MalformedMetadata {
+                    reason: "config.json declares too many decoder layers".into(),
+                });
             }
             raw.layer_types = Some(
                 (0..num_hidden_layers)
