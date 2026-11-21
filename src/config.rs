@@ -769,14 +769,13 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
     if matches!(
         model_type.as_str(),
         "llama" | "qwen2" | "qwen2moe" | "qwen2_moe" | "mistral" | "olmo3" | "smollm3"
-    ) {
-        if let Some(activation) = raw.hidden_act.as_deref().filter(|value| *value != "silu") {
-            return Err(ProductionIngestionError::UnsupportedFormat {
-                reason: format!(
-                    "config.json's hidden_act '{activation}' is not supported for {model_type}; only silu is available"
-                ),
-            });
-        }
+    ) && let Some(activation) = raw.hidden_act.as_deref().filter(|value| *value != "silu")
+    {
+        return Err(ProductionIngestionError::UnsupportedFormat {
+            reason: format!(
+                "config.json's hidden_act '{activation}' is not supported for {model_type}; only silu is available"
+            ),
+        });
     }
 
     // The portable configuration does not yet carry SmolLM3's per-layer
