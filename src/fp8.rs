@@ -1,8 +1,8 @@
 //! Reference conversion for block-scaled FP8 E4M3FN weights.
 //!
 //! This module does not yet enable FP8 checkpoint ingestion. In particular,
-//! the Safetensors parser still rejects FP8 until scale tensors, their shard
-//! identities and the checkpoint's quantization metadata are validated.
+//! the ingestor rejects FP8 until scale tensors, their shard identities and
+//! the checkpoint's quantization metadata are validated.
 
 use std::{error::Error, fmt};
 

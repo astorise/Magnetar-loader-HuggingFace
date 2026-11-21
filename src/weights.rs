@@ -330,6 +330,18 @@ pub fn discover_and_parse_weights(
             });
         };
 
+    // The format parser recognizes E4M3FN as a distinct byte dtype, but
+    // production ingestion must not admit it until the matching block
+    // scales and quantization configuration are associated and validated.
+    if tensors
+        .iter()
+        .any(|tensor| tensor.storage_dtype == magnetar_runtime::model::ModelDType::F8E4M3Fn)
+    {
+        return Err(ProductionIngestionError::UnsupportedFormat {
+            reason: "block-scaled FP8 weight ingestion is not yet connected".into(),
+        });
+    }
+
     // GPTQ-quantized projections replace their raw `.qweight`/`.qzeros`/
     // `.scales`/`.g_idx` quadruple with one synthesized `<prefix>.weight`
     // placeholder here, *before* the renaming loop below runs (`naming.rs`
@@ -623,6 +635,25 @@ mod tests {
             .unwrap();
         file.write_all(&header_bytes).unwrap();
         file.write_all(&data).unwrap();
+    }
+
+    #[test]
+    fn fp8_is_rejected_until_block_scales_are_connected() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = br#"{"model.layers.0.mlp.up_proj.weight":{"dtype":"F8_E4M3","shape":[1,1],"data_offsets":[0,1]}}"#;
+        let mut file = fs::File::create(dir.path().join(SINGLE_FILE_NAME)).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(header).unwrap();
+        file.write_all(&[0x38]).unwrap();
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        assert!(matches!(
+            discover_and_parse_weights(&source),
+            Err(ProductionIngestionError::UnsupportedFormat { .. })
+        ));
     }
 
     #[test]
