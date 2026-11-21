@@ -53,6 +53,8 @@ struct RawHfConfig {
     #[serde(default)]
     hidden_act: Option<String>,
     #[serde(default)]
+    hidden_activation: Option<String>,
+    #[serde(default)]
     no_rope_layers: Option<Vec<u8>>,
     #[serde(default)]
     no_rope_layer_interval: Option<u32>,
@@ -720,6 +722,9 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
     let activation_is_null = config_value
         .get("hidden_act")
         .is_some_and(|value| value.is_null());
+    let named_activation_is_null = config_value
+        .get("hidden_activation")
+        .is_some_and(|value| value.is_null());
     let mut raw: RawHfConfig = serde_json::from_value(config_value).map_err(shape_error)?;
     if let Some(model_type) = outer_model_type {
         raw.model_type = Some(model_type);
@@ -773,20 +778,63 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
     // Reject alternatives until a Component implements and qualifies them.
     // An omitted field follows these model classes' SiLU default; explicit
     // null is malformed and must not be mistaken for an omitted field.
-    if activation_is_null {
+    if activation_is_null || named_activation_is_null {
         return Err(ProductionIngestionError::MalformedMetadata {
-            reason: "config.json's hidden_act must be a supported activation string".into(),
+            reason: "config.json's activation must be a supported activation string".into(),
         });
     }
-    if matches!(
+    if let (Some(short), Some(named)) = (&raw.hidden_act, &raw.hidden_activation)
+        && short != named
+    {
+        return Err(ProductionIngestionError::MalformedMetadata {
+            reason: "config.json declares conflicting activation fields".into(),
+        });
+    }
+    let gemma = matches!(
         model_type.as_str(),
-        "llama" | "qwen2" | "qwen2moe" | "qwen2_moe" | "mistral" | "olmo3" | "smollm3"
-    ) && let Some(activation) = raw.hidden_act.as_deref().filter(|value| *value != "silu")
+        "gemma4" | "gemma4_text" | "gemma4_unified"
+    );
+    let fixed_silu = matches!(
+        model_type.as_str(),
+        "llama"
+            | "qwen2"
+            | "qwen2moe"
+            | "qwen2_moe"
+            | "mistral"
+            | "olmo3"
+            | "smollm3"
+            | "deepseek"
+            | "deepseek_v2"
+            | "deepseek_v3"
+            | "deepseek2"
+    );
+    let hidden_activation = raw
+        .hidden_activation
+        .clone()
+        .or_else(|| raw.hidden_act.clone())
+        .or_else(|| {
+            if gemma {
+                Some("gelu_pytorch_tanh".into())
+            } else if fixed_silu {
+                Some("silu".into())
+            } else {
+                None
+            }
+        });
+    if fixed_silu
+        && let Some(activation) = hidden_activation
+            .as_deref()
+            .filter(|value| *value != "silu")
     {
         return Err(ProductionIngestionError::UnsupportedFormat {
             reason: format!(
                 "config.json's hidden_act '{activation}' is not supported for {model_type}; only silu is available"
             ),
+        });
+    }
+    if gemma && hidden_activation.as_deref() != Some("gelu_pytorch_tanh") {
+        return Err(ProductionIngestionError::UnsupportedFormat {
+            reason: "Gemma 4 requires the gelu_pytorch_tanh activation in this Component".into(),
         });
     }
 
@@ -957,13 +1005,7 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
         rope_scaling_factor,
         rope_frequency_scaling,
         rope_layers,
-        hidden_activation: raw.hidden_act.clone().or_else(|| {
-            matches!(
-                model_type.as_str(),
-                "llama" | "qwen2" | "qwen2moe" | "qwen2_moe" | "mistral" | "olmo3" | "smollm3"
-            )
-            .then(|| "silu".to_string())
-        }),
+        hidden_activation,
         tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(model_type == "smollm3"),
         // `config.json` never declares this for real Qwen2/2.5 checkpoints
         // (it's an architectural default of the model class, not a
@@ -1189,7 +1231,15 @@ mod tests {
 
     #[test]
     fn fixed_silu_components_reject_different_or_malformed_activations() {
-        for family in ["llama", "qwen2", "qwen2_moe", "mistral", "olmo3"] {
+        for family in [
+            "llama",
+            "qwen2",
+            "qwen2_moe",
+            "mistral",
+            "olmo3",
+            "smollm3",
+            "deepseek_v2",
+        ] {
             let mut value: serde_json::Value =
                 serde_json::from_slice(&qwen2_0_5b_config()).unwrap();
             value["model_type"] = family.into();
@@ -1228,6 +1278,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn gemma4_named_activation_is_preserved_and_validated() {
+        let mut value: serde_json::Value = serde_json::from_slice(&qwen2_0_5b_config()).unwrap();
+        value["model_type"] = "gemma4".into();
+        let config = parse(&serde_json::to_vec(&value).unwrap())
+            .unwrap()
+            .architecture_config;
+        assert_eq!(
+            config.hidden_activation.as_deref(),
+            Some("gelu_pytorch_tanh")
+        );
+        value["hidden_activation"] = "gelu_pytorch_tanh".into();
+        let config = parse(&serde_json::to_vec(&value).unwrap())
+            .unwrap()
+            .architecture_config;
+        assert_eq!(
+            config.hidden_activation.as_deref(),
+            Some("gelu_pytorch_tanh")
+        );
+        for invalid in [
+            serde_json::json!("silu"),
+            serde_json::json!("gelu"),
+            serde_json::Value::Null,
+            serde_json::json!(42),
+        ] {
+            value["hidden_activation"] = invalid;
+            assert!(parse(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+        value["hidden_activation"] = "gelu_pytorch_tanh".into();
+        value["hidden_act"] = "silu".into();
+        assert!(matches!(
+            parse(&serde_json::to_vec(&value).unwrap()),
+            Err(ProductionIngestionError::MalformedMetadata { .. })
+        ));
     }
 
     #[test]
