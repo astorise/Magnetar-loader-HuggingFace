@@ -606,6 +606,13 @@ pub(crate) fn discover_and_parse_weights_for_model(
         if let Some(location) = payload_source.locations.remove(&tensor.name) {
             renamed_locations.insert(canonical.clone(), location);
         }
+        // A depthwise `nn.Conv1d` weight `[channels, 1, kernel]` is the
+        // mixer's `[channels, kernel]`: the same bytes.
+        if canonical.ends_with(".linear_attn.conv1d")
+            && let [channels, 1, kernel] = tensor.shape[..]
+        {
+            tensor.shape = vec![channels, kernel];
+        }
         tensor.name = canonical;
     }
     // `payload_source.locations` at this point holds only whatever the

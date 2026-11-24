@@ -5,8 +5,8 @@
 
 use magnetar_runtime::model::{
     ExpertGroupScore, ExpertGroups, ExpertNormalization, ExpertRoutingConfig, ExpertScoring,
-    LatentAttentionConfig, LayerSpec, MixtureOfExpertsConfig, ModelArchitectureConfig,
-    RopeFrequencyScaling,
+    LatentAttentionConfig, LayerSpec, LinearAttentionConfig, MixtureOfExpertsConfig,
+    ModelArchitectureConfig, RopeFrequencyScaling,
 };
 use magnetar_runtime::model_format_roadmap::{HfConfigMetadata, HfRopeMetadata};
 use magnetar_runtime::operator::{RopeBandedFrequencyScaling, RopeYarnFrequencyScaling};
@@ -151,6 +151,141 @@ struct RawHfConfig {
     scoring_func: Option<String>,
     #[serde(default)]
     rope_interleave: Option<bool>,
+    // Qwen3.5's hybrid decoder (`support-qwen38-flash-next`): read by
+    // `qwen35_config`.
+    #[serde(default)]
+    linear_num_key_heads: Option<u32>,
+    #[serde(default)]
+    linear_num_value_heads: Option<u32>,
+    #[serde(default)]
+    linear_key_head_dim: Option<u64>,
+    #[serde(default)]
+    linear_value_head_dim: Option<u64>,
+    #[serde(default)]
+    linear_conv_kernel_dim: Option<u32>,
+    #[serde(default)]
+    attn_output_gate: Option<bool>,
+    #[serde(default)]
+    full_attention_interval: Option<u32>,
+}
+
+/// Qwen3.5's hybrid decoder, read from its text configuration: which layers
+/// are gated-delta linear attention, their mixer geometry, and the layout of
+/// its full-attention layers (partial rotary). Its norms are zero-centered
+/// and its attention output is gated by default.
+struct Qwen35Config {
+    linear_attention: LinearAttentionConfig,
+    layout: Vec<LayerSpec>,
+    rope_theta: f64,
+    attention_output_gate: bool,
+}
+
+/// [`Qwen35Config`] for `qwen3_5`/`qwen3_5_text`, taking the `layer_types`
+/// it reads out of `raw` so the layered decoders' reading never sees
+/// `linear_attention` entries. `None` for other model types.
+fn qwen35_config(
+    raw: &mut RawHfConfig,
+    model_type: &str,
+    num_hidden_layers: u32,
+    num_key_value_heads: u32,
+    head_dim: u64,
+    intermediate_size: u64,
+) -> Result<Option<Qwen35Config>, ProductionIngestionError> {
+    if !matches!(model_type, "qwen3_5" | "qwen3_5_text") {
+        return Ok(None);
+    }
+    let malformed = |reason: String| ProductionIngestionError::MalformedMetadata { reason };
+    if num_hidden_layers > 4096 {
+        return Err(malformed(
+            "config.json declares too many decoder layers".into(),
+        ));
+    }
+    let layer_types = match raw.layer_types.take() {
+        Some(types) => types,
+        None => {
+            let interval = raw.full_attention_interval.unwrap_or(4);
+            if interval == 0 {
+                return Err(malformed(
+                    "config.json's full_attention_interval must be positive".into(),
+                ));
+            }
+            (0..num_hidden_layers)
+                .map(|layer| {
+                    if (layer + 1) % interval == 0 {
+                        "full_attention"
+                    } else {
+                        "linear_attention"
+                    }
+                    .to_string()
+                })
+                .collect()
+        }
+    };
+    if layer_types.len() != num_hidden_layers as usize {
+        return Err(malformed(format!(
+            "config.json's layer_types has {} entries for {num_hidden_layers} layers",
+            layer_types.len()
+        )));
+    }
+    let layers = layer_types
+        .iter()
+        .map(|kind| match kind.as_str() {
+            "linear_attention" => Ok(true),
+            "full_attention" => Ok(false),
+            other => Err(ProductionIngestionError::UnsupportedFormat {
+                reason: format!("config.json's Qwen3.5 layer type '{other}' is not supported"),
+            }),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let required_u32 = |value: Option<u32>, field: &str| required(value, field);
+    let linear_attention = LinearAttentionConfig {
+        layers,
+        key_heads: required_u32(raw.linear_num_key_heads, "linear_num_key_heads")?,
+        value_heads: required_u32(raw.linear_num_value_heads, "linear_num_value_heads")?,
+        key_head_dim: required(raw.linear_key_head_dim, "linear_key_head_dim")?,
+        value_head_dim: required(raw.linear_value_head_dim, "linear_value_head_dim")?,
+        conv_kernel: raw.linear_conv_kernel_dim.unwrap_or(4),
+    };
+    // Text positions are equal on every M-RoPE axis, so the interleaved
+    // sections reduce to one rotation of the first
+    // `partial_rotary_factor * head_dim` values.
+    let parameters = rope_parameters(raw)?;
+    let flat = parameters.get("");
+    let rope_theta = raw
+        .rope_theta
+        .or(flat.and_then(|flat| flat.rope_theta))
+        .unwrap_or(10_000_000.0);
+    if let Some(kind) = flat.and_then(|flat| flat.rope_type.as_deref())
+        && kind != "default"
+    {
+        return Err(ProductionIngestionError::UnsupportedFormat {
+            reason: format!("config.json's Qwen3.5 rope_type '{kind}' is not supported"),
+        });
+    }
+    let partial_rotary_factor = flat
+        .and_then(|flat| flat.partial_rotary_factor)
+        .unwrap_or(0.25);
+    if !(partial_rotary_factor > 0.0 && partial_rotary_factor <= 1.0) {
+        return Err(malformed(format!(
+            "config.json's partial_rotary_factor {partial_rotary_factor} must lie in (0, 1]"
+        )));
+    }
+    let layer = LayerSpec {
+        sliding_window: None,
+        head_dim,
+        num_key_value_heads,
+        rope_theta,
+        partial_rotary_factor: (partial_rotary_factor != 1.0).then_some(partial_rotary_factor),
+        value_from_key: false,
+        kv_source_layer: None,
+        intermediate_size,
+    };
+    Ok(Some(Qwen35Config {
+        linear_attention,
+        layout: vec![layer; num_hidden_layers as usize],
+        rope_theta,
+        attention_output_gate: raw.attn_output_gate.unwrap_or(true),
+    }))
 }
 
 /// One layer type's RoPE in `rope_parameters`, or the whole of a flat one.
@@ -903,6 +1038,8 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
             | "deepseek2"
             | "glm4_moe_lite"
             | "kimi_k2"
+            | "qwen3_5"
+            | "qwen3_5_text"
     );
     let hidden_activation = raw
         .hidden_activation
@@ -1051,6 +1188,14 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
             1e-6
         },
     ) as f32;
+    let qwen35 = qwen35_config(
+        &mut raw,
+        &model_type,
+        num_hidden_layers,
+        num_key_value_heads,
+        head_dim,
+        intermediate_size,
+    )?;
     let layered = layered_config(&raw, num_hidden_layers, num_attention_heads, head_dim)?;
     // `rope_theta`, else a flat `rope_parameters`' (newer `transformers`
     // releases moved it there), else a layered decoder's sliding layers'.
@@ -1059,6 +1204,7 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
         .and_then(|flat| flat.rope_theta);
     let rope_theta = raw
         .rope_theta
+        .or(qwen35.as_ref().map(|qwen35| qwen35.rope_theta))
         .or(flat_rope_theta)
         .or(layered.as_ref().map(|layered| layered.rope_theta))
         .unwrap_or(if model_type == "smollm3" {
@@ -1117,12 +1263,21 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
         mixture_of_experts,
         bos_token_id: raw.bos_token_id,
         eos_token_id: raw.eos_token_id.as_ref().and_then(RawEosTokenId::first),
-        layer_layout: layered.and_then(|layered| layered.layout),
+        layer_layout: match &qwen35 {
+            Some(qwen35) => Some(qwen35.layout.clone()),
+            None => layered.and_then(|layered| layered.layout),
+        },
         final_logit_softcapping: raw.final_logit_softcapping,
         per_layer_input_size: raw.hidden_size_per_layer_input.filter(|size| *size > 0),
         latent_attention: latent,
         moe_layers,
         expert_routing,
+        attention_output_gate: qwen35
+            .as_ref()
+            .is_some_and(|qwen35| qwen35.attention_output_gate),
+        // Qwen3.5's RMSNorms scale by `1 + weight`.
+        norm_weight_offset: qwen35.as_ref().map(|_| 1.0),
+        linear_attention: qwen35.map(|qwen35| qwen35.linear_attention),
     };
     architecture_config.validate().map_err(|error| {
         ProductionIngestionError::MalformedMetadata {
@@ -1672,6 +1827,76 @@ mod tests {
 #[cfg(test)]
 mod layered_tests {
     use super::*;
+
+    /// Qwen3.5-0.8B-Base's `config.json` at revision
+    /// dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68 (Apache-2.0): a multimodal
+    /// bundle whose `text_config` is the hybrid decoder.
+    #[test]
+    fn qwen35_declares_linear_layers_gated_attention_and_zero_centered_norms() {
+        let path = format!(
+            "{}/testdata/qwen35/Qwen3.5-0.8B-Base.config.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let parsed = parse(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(parsed.metadata.model_type, "qwen3_5");
+        let config = parsed.architecture_config;
+        assert_eq!(
+            (
+                config.num_hidden_layers,
+                config.num_attention_heads,
+                config.num_key_value_heads
+            ),
+            (24, 8, 2)
+        );
+        assert_eq!((config.head_dim, config.hidden_size), (256, 1024));
+        assert_eq!(config.rope_theta, 10_000_000.0);
+        assert!(config.tie_word_embeddings);
+        assert!(config.attention_output_gate);
+        assert_eq!(config.norm_weight_offset, Some(1.0));
+        assert_eq!(config.hidden_activation.as_deref(), Some("silu"));
+        let linear = config.linear_attention.unwrap();
+        assert_eq!(
+            (
+                linear.key_heads,
+                linear.value_heads,
+                linear.key_head_dim,
+                linear.value_head_dim
+            ),
+            (16, 16, 128, 128)
+        );
+        assert_eq!(linear.conv_kernel, 4);
+        assert_eq!(
+            linear.layers,
+            (0..24)
+                .map(|layer| (layer + 1) % 4 != 0)
+                .collect::<Vec<_>>()
+        );
+        let layout = config.layer_layout.unwrap();
+        assert_eq!(layout.len(), 24);
+        assert!(
+            layout
+                .iter()
+                .all(|layer| layer.partial_rotary_factor == Some(0.25)
+                    && layer.head_dim == 256
+                    && layer.num_key_value_heads == 2
+                    && layer.sliding_window.is_none())
+        );
+    }
+
+    #[test]
+    fn qwen35_refuses_an_unknown_layer_type() {
+        let path = format!(
+            "{}/testdata/qwen35/Qwen3.5-0.8B-Base.config.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        value["text_config"]["layer_types"][0] = "sliding_attention".into();
+        assert!(matches!(
+            parse(&serde_json::to_vec(&value).unwrap()),
+            Err(ProductionIngestionError::UnsupportedFormat { .. })
+        ));
+    }
 
     fn parse_testdata(name: &str) -> ModelArchitectureConfig {
         let path = format!(

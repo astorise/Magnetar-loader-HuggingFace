@@ -14,7 +14,7 @@ use magnetar_runtime::production_model_ingestion::ProductionIngestionError;
 
 /// The prefixes of a multimodal bundle's non-text towers. Their tensors are
 /// not part of the text decoder and are left out of the inventory.
-const NON_TEXT_PREFIXES: [&str; 6] = [
+const NON_TEXT_PREFIXES: [&str; 8] = [
     "model.vision_tower.",
     "model.audio_tower.",
     "model.embed_vision.",
@@ -22,6 +22,10 @@ const NON_TEXT_PREFIXES: [&str; 6] = [
     "model.multi_modal_projector.",
     // `gemma4_unified` bundles embed image patches directly.
     "model.vision_embedder.",
+    // Qwen3.5's vision tower, and its multi-token prediction head, which
+    // the text decoder's forward pass does not use.
+    "model.visual.",
+    "mtp.",
 ];
 
 /// Whether `raw` belongs to a multimodal bundle's vision or audio tower
@@ -67,6 +71,19 @@ pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionErr
         }
         None => raw,
     };
+    // Qwen3.5's gated-delta parameters have no `.weight` suffix.
+    if let Some((layer_index, field)) = raw
+        .strip_prefix("model.layers.")
+        .and_then(|rest| rest.split_once('.'))
+        && layer_index.parse::<u64>().is_ok()
+        && let Some(canonical) = match field {
+            "linear_attn.A_log" => Some("linear_attn.a_log"),
+            "linear_attn.dt_bias" => Some("linear_attn.dt_bias"),
+            _ => None,
+        }
+    {
+        return Ok(format!("layers.{layer_index}.{canonical}"));
+    }
     // A per-layer scalar has no `.weight` suffix.
     if let Some(layer_index) = raw
         .strip_prefix("model.layers.")
@@ -201,6 +218,17 @@ pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionErr
             "per_layer_projection" => "per_layer_projection",
             "post_per_layer_input_norm" => "post_per_layer_input_norm",
             "router.proj" => crate::layered_tensors::ROUTER_PROJECTION,
+            // Qwen3.5's gated-delta mixer (`support-qwen38-flash-next`).
+            // The `gated-delta-mixer` operator takes these projections in
+            // checkpoint `[out, in]` order, so their names leave out
+            // `proj`, which would transpose them (`weight_layout.rs`).
+            "linear_attn.in_proj_qkv" => "linear_attn.in_qkv",
+            "linear_attn.in_proj_z" => "linear_attn.in_z",
+            "linear_attn.in_proj_a" => "linear_attn.in_a",
+            "linear_attn.in_proj_b" => "linear_attn.in_b",
+            "linear_attn.conv1d" => "linear_attn.conv1d",
+            "linear_attn.norm" => "linear_attn.norm",
+            "linear_attn.out_proj" => "linear_attn.out",
             // Latent attention (`express-latent-attention-forms`): the
             // fused projections take internal names that
             // `layered_tensors.rs` splits by rows.
@@ -362,6 +390,83 @@ mod layered_tests {
         for (raw, canonical) in cases {
             assert_eq!(normalize_tensor_name(raw).unwrap(), canonical, "{raw}");
         }
+    }
+
+    #[test]
+    fn qwen35_mixer_tensors_keep_checkpoint_order_names() {
+        for (raw, canonical) in [
+            (
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                "layers.0.linear_attn.in_qkv",
+            ),
+            (
+                "model.language_model.layers.1.linear_attn.in_proj_z.weight",
+                "layers.1.linear_attn.in_z",
+            ),
+            (
+                "model.language_model.layers.2.linear_attn.in_proj_a.weight",
+                "layers.2.linear_attn.in_a",
+            ),
+            (
+                "model.language_model.layers.2.linear_attn.in_proj_b.weight",
+                "layers.2.linear_attn.in_b",
+            ),
+            (
+                "model.language_model.layers.4.linear_attn.conv1d.weight",
+                "layers.4.linear_attn.conv1d",
+            ),
+            (
+                "model.language_model.layers.5.linear_attn.A_log",
+                "layers.5.linear_attn.a_log",
+            ),
+            (
+                "model.language_model.layers.5.linear_attn.dt_bias",
+                "layers.5.linear_attn.dt_bias",
+            ),
+            (
+                "model.language_model.layers.6.linear_attn.norm.weight",
+                "layers.6.linear_attn.norm",
+            ),
+            (
+                "model.language_model.layers.6.linear_attn.out_proj.weight",
+                "layers.6.linear_attn.out",
+            ),
+        ] {
+            let name = normalize_tensor_name(raw).unwrap();
+            assert_eq!(name, canonical);
+            // The mixer takes these in checkpoint `[out, in]` order.
+            assert!(!name.contains("proj"), "{name}");
+        }
+        assert!(is_non_text_tensor("model.visual.blocks.0.attn.qkv.weight"));
+        assert!(is_non_text_tensor("mtp.layers.0.self_attn.q_proj.weight"));
+    }
+
+    /// Every tensor name of the pinned Qwen3.5-0.8B-Base safetensors header
+    /// (revision dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68) is either left
+    /// out (vision tower, MTP head) or takes a canonical name.
+    #[test]
+    fn every_qwen35_checkpoint_tensor_is_named_or_left_out() {
+        let names = include_str!("../testdata/qwen35/Qwen3.5-0.8B-Base.tensor-names.txt");
+        let names: Vec<&str> = names.lines().collect();
+        assert_eq!(names.len(), 488);
+        let text: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|name| !is_non_text_tensor(name))
+            .collect();
+        assert_eq!(names.len() - text.len(), 153 + 15);
+        let canonical: std::collections::BTreeSet<String> = text
+            .iter()
+            .map(|name| normalize_tensor_name(name).unwrap())
+            .collect();
+        assert_eq!(canonical.len(), text.len());
+        assert_eq!(
+            canonical
+                .iter()
+                .filter(|name| name.contains(".linear_attn."))
+                .count(),
+            18 * 9
+        );
     }
 
     #[test]
