@@ -217,9 +217,10 @@ struct Qwen35Config {
     attention_output_gate: bool,
     /// Qwen4-Exp's `1.14.0` forms; empty for Qwen3.5.
     extensions: DecoderExtensions,
-    /// Qwen4-Exp's every-layer mixture of experts with a gated shared
-    /// expert.
-    experts: Option<(MixtureOfExpertsConfig, ExpertRoutingConfig)>,
+    /// Qwen4-Exp's every-layer mixture of experts. Its routing is the
+    /// `1.5.0` one (softmax over every expert, a gated shared expert), so
+    /// it declares no `expert-routing`.
+    experts: Option<MixtureOfExpertsConfig>,
 }
 
 /// [`Qwen35Config`] for `qwen3_5`/`qwen3_5_text` and, with its residual
@@ -352,13 +353,7 @@ fn qwen4_exp_forms(
     raw: &RawHfConfig,
     linear_attention: &LinearAttentionConfig,
     head_dim: u64,
-) -> Result<
-    (
-        DecoderExtensions,
-        (MixtureOfExpertsConfig, ExpertRoutingConfig),
-    ),
-    ProductionIngestionError,
-> {
+) -> Result<(DecoderExtensions, MixtureOfExpertsConfig), ProductionIngestionError> {
     let malformed = |reason: String| ProductionIngestionError::MalformedMetadata { reason };
     let hyper_connections = HyperConnectionConfig {
         streams: raw.hc_count.unwrap_or(4),
@@ -474,14 +469,6 @@ fn qwen4_exp_forms(
         )?),
         normalize_top_k: raw.norm_topk_prob.unwrap_or(true),
     };
-    let routing = ExpertRoutingConfig {
-        scoring: ExpertScoring::Softmax,
-        groups: None,
-        routed_scaling_factor: 1.0,
-        selection_bias: false,
-        normalization: None,
-        shared_expert_gated: true,
-    };
     Ok((
         DecoderExtensions {
             hyper_connections: Some(hyper_connections),
@@ -489,7 +476,7 @@ fn qwen4_exp_forms(
             token_selection,
             sigmoid_linear_gate,
         },
-        (experts, routing),
+        experts,
     ))
 }
 
@@ -1456,7 +1443,7 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
     let (mixture_of_experts, moe_layers, expert_routing) = match routed {
         Some((moe, layers, routing)) => (Some(moe), layers, Some(routing)),
         None => match qwen35.as_ref().and_then(|qwen35| qwen35.experts) {
-            Some((moe, routing)) => (Some(moe), None, Some(routing)),
+            Some(moe) => (Some(moe), None, None),
             None => (mixture_of_experts(&raw)?, None, None),
         },
     };
@@ -2195,9 +2182,9 @@ mod layered_tests {
         assert_eq!(moe.expert_intermediate_size, 12);
         assert_eq!(moe.shared_expert_intermediate_size, Some(12));
         assert!(moe.normalize_top_k);
-        let routing = config.expert_routing.unwrap();
-        assert_eq!(routing.scoring, ExpertScoring::Softmax);
-        assert!(routing.shared_expert_gated);
+        // The `1.5.0` routing: a softmax over every expert and a gated
+        // shared expert, which a Component reads without `expert-routing`.
+        assert!(config.expert_routing.is_none());
     }
 
     #[test]
