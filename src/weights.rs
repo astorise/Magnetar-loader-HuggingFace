@@ -608,7 +608,7 @@ pub(crate) fn discover_and_parse_weights_for_model(
         }
         // A depthwise `nn.Conv1d` weight `[channels, 1, kernel]` is the
         // mixer's `[channels, kernel]`: the same bytes.
-        if canonical.ends_with(".linear_attn.conv1d")
+        if (canonical.ends_with(".linear_attn.conv1d") || canonical.ends_with(".ple.conv1d"))
             && let [channels, 1, kernel] = tensor.shape[..]
         {
             tensor.shape = vec![channels, kernel];

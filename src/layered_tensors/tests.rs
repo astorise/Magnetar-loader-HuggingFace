@@ -581,3 +581,84 @@ fn inconsistent_latent_or_per_expert_tensors_are_refused() {
         &no_experts,
     )));
 }
+
+/// `support-qwen38-flash-next`: a layer's n-gram table stored in shards of
+/// consecutive rows is one `[rows, head_dim]` table, in shard order whatever
+/// the file's; its integer hash buffers are left out and its projections
+/// keep the checkpoint's `[out, in]` order.
+#[test]
+fn ngram_table_shards_are_stacked_in_shard_order() {
+    let config = ModelArchitectureConfig {
+        hidden_size: 3,
+        num_hidden_layers: 2,
+        ..Default::default()
+    };
+    let tensors = [
+        stored_from(
+            "model.layers.1.ple.ple_embedding.ngram_embedding.shard_1.weight",
+            &[3, 2],
+            100.0,
+        ),
+        stored_from(
+            "model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
+            &[3, 2],
+            200.0,
+        ),
+        stored_from("model.layers.1.ple.key_proj.weight", &[6, 4], 300.0),
+        stored_from("model.layers.1.ple.conv1d.weight", &[6, 1, 4], 400.0),
+    ];
+    let (inventory, payload) = ingest(&tensors, &config).unwrap();
+    let (shape, values) = read(&inventory, &payload, "layers.1.ple.table");
+    assert_eq!(shape, vec![6, 2]);
+    assert_eq!(
+        values,
+        [tensors[1].values.clone(), tensors[0].values.clone()].concat()
+    );
+    // `[out, in]` order: not transposed.
+    let (shape, values) = read(&inventory, &payload, "layers.1.ple.key");
+    assert_eq!(shape, vec![6, 4]);
+    assert_eq!(values, tensors[2].values);
+    let (shape, _) = read(&inventory, &payload, "layers.1.ple.conv1d");
+    assert_eq!(shape, vec![6, 4]);
+    assert!(
+        !inventory
+            .iter()
+            .any(|tensor| tensor.name.contains("packed."))
+    );
+}
+
+#[test]
+fn inconsistent_ngram_table_shards_are_refused() {
+    let config = ModelArchitectureConfig {
+        hidden_size: 3,
+        num_hidden_layers: 1,
+        ..Default::default()
+    };
+    // A missing shard, and shards of different widths.
+    let name = |shard: u32| -> &'static str {
+        Box::leak(
+            format!("model.layers.0.ple.ple_embedding.ngram_embedding.shard_{shard}.weight")
+                .into_boxed_str(),
+        )
+    };
+    assert!(
+        ingest(
+            &[
+                stored_from(name(0), &[3, 2], 0.0),
+                stored_from(name(2), &[3, 2], 0.0)
+            ],
+            &config
+        )
+        .is_err()
+    );
+    assert!(
+        ingest(
+            &[
+                stored_from(name(0), &[3, 2], 0.0),
+                stored_from(name(1), &[3, 4], 0.0)
+            ],
+            &config
+        )
+        .is_err()
+    );
+}
