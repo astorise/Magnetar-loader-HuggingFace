@@ -4,9 +4,10 @@
 //! task group 3, Decision 5).
 
 use magnetar_runtime::model::{
-    ExpertGroupScore, ExpertGroups, ExpertNormalization, ExpertRoutingConfig, ExpertScoring,
-    LatentAttentionConfig, LayerSpec, LinearAttentionConfig, MixtureOfExpertsConfig,
-    ModelArchitectureConfig, RopeFrequencyScaling,
+    DecoderExtensions, ExpertGroupScore, ExpertGroups, ExpertNormalization, ExpertRoutingConfig,
+    ExpertScoring, HyperConnectionConfig, LatentAttentionConfig, LayerSpec, LinearAttentionConfig,
+    MixtureOfExpertsConfig, ModelArchitectureConfig, NgramEmbeddingConfig, RopeFrequencyScaling,
+    TokenSelectionConfig,
 };
 use magnetar_runtime::model_format_roadmap::{HfConfigMetadata, HfRopeMetadata};
 use magnetar_runtime::operator::{RopeBandedFrequencyScaling, RopeYarnFrequencyScaling};
@@ -167,6 +168,42 @@ struct RawHfConfig {
     attn_output_gate: Option<bool>,
     #[serde(default)]
     full_attention_interval: Option<u32>,
+    // Qwen4-Exp's residual streams, n-gram embeddings, indexer and linear
+    // gate (`support-qwen38-flash-next`): read by `qwen35_config`.
+    #[serde(default)]
+    hc_count: Option<u32>,
+    #[serde(default)]
+    hc_lowrank: Option<u32>,
+    #[serde(default)]
+    ple_layer_ids: Option<Vec<u32>>,
+    #[serde(default)]
+    ple_embed_dim: Option<u64>,
+    #[serde(default)]
+    ple_conv_kernel_size: Option<u32>,
+    #[serde(default)]
+    ngram_size: Option<u32>,
+    #[serde(default)]
+    heads_per_ngram: Option<u32>,
+    #[serde(default)]
+    ngram_vocab_size_base: Option<u64>,
+    #[serde(default)]
+    make_ngram_vocab_size_divisible_by: Option<u32>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    indexer_n_heads: Option<u32>,
+    #[serde(default)]
+    indexer_kv_heads: Option<u32>,
+    #[serde(default)]
+    indexer_head_dim: Option<u64>,
+    #[serde(default)]
+    indexer_budget: Option<u32>,
+    #[serde(default)]
+    indexer_compress_ratio: Option<u32>,
+    #[serde(default)]
+    output_gate_type: Option<String>,
+    #[serde(default)]
+    shared_expert_intermediate_size: Option<u64>,
 }
 
 /// Qwen3.5's hybrid decoder, read from its text configuration: which layers
@@ -178,11 +215,18 @@ struct Qwen35Config {
     layout: Vec<LayerSpec>,
     rope_theta: f64,
     attention_output_gate: bool,
+    /// Qwen4-Exp's `1.14.0` forms; empty for Qwen3.5.
+    extensions: DecoderExtensions,
+    /// Qwen4-Exp's every-layer mixture of experts with a gated shared
+    /// expert.
+    experts: Option<(MixtureOfExpertsConfig, ExpertRoutingConfig)>,
 }
 
-/// [`Qwen35Config`] for `qwen3_5`/`qwen3_5_text`, taking the `layer_types`
-/// it reads out of `raw` so the layered decoders' reading never sees
-/// `linear_attention` entries. `None` for other model types.
+/// [`Qwen35Config`] for `qwen3_5`/`qwen3_5_text` and, with its residual
+/// streams, n-gram embeddings and indexer, `qwen4_exp`/`qwen4_exp_text`,
+/// taking the `layer_types` it reads out of `raw` so the layered decoders'
+/// reading never sees `linear_attention` entries. `None` for other model
+/// types.
 fn qwen35_config(
     raw: &mut RawHfConfig,
     model_type: &str,
@@ -191,7 +235,8 @@ fn qwen35_config(
     head_dim: u64,
     intermediate_size: u64,
 ) -> Result<Option<Qwen35Config>, ProductionIngestionError> {
-    if !matches!(model_type, "qwen3_5" | "qwen3_5_text") {
+    let qwen4 = matches!(model_type, "qwen4_exp" | "qwen4_exp_text");
+    if !qwen4 && !matches!(model_type, "qwen3_5" | "qwen3_5_text") {
         return Ok(None);
     }
     let malformed = |reason: String| ProductionIngestionError::MalformedMetadata { reason };
@@ -232,6 +277,8 @@ fn qwen35_config(
         .map(|kind| match kind.as_str() {
             "linear_attention" => Ok(true),
             "full_attention" => Ok(false),
+            // Qwen4-Exp's full attention reads its tokens through an indexer.
+            "indexed_attention" if qwen4 => Ok(false),
             other => Err(ProductionIngestionError::UnsupportedFormat {
                 reason: format!("config.json's Qwen3.5 layer type '{other}' is not supported"),
             }),
@@ -262,9 +309,10 @@ fn qwen35_config(
             reason: format!("config.json's Qwen3.5 rope_type '{kind}' is not supported"),
         });
     }
+    // Qwen3.5 rotates a quarter of each head by default, Qwen4-Exp all of it.
     let partial_rotary_factor = flat
         .and_then(|flat| flat.partial_rotary_factor)
-        .unwrap_or(0.25);
+        .unwrap_or(if qwen4 { 1.0 } else { 0.25 });
     if !(partial_rotary_factor > 0.0 && partial_rotary_factor <= 1.0) {
         return Err(malformed(format!(
             "config.json's partial_rotary_factor {partial_rotary_factor} must lie in (0, 1]"
@@ -280,12 +328,169 @@ fn qwen35_config(
         kv_source_layer: None,
         intermediate_size,
     };
+    let (extensions, experts) = if qwen4 {
+        let (extensions, experts) = qwen4_exp_forms(raw, &linear_attention, head_dim)?;
+        (extensions, Some(experts))
+    } else {
+        (DecoderExtensions::default(), None)
+    };
     Ok(Some(Qwen35Config {
         linear_attention,
         layout: vec![layer; num_hidden_layers as usize],
         rope_theta,
-        attention_output_gate: raw.attn_output_gate.unwrap_or(true),
+        // Qwen4-Exp's attention is always gated.
+        attention_output_gate: qwen4 || raw.attn_output_gate.unwrap_or(true),
+        extensions,
+        experts,
     }))
+}
+
+/// Qwen4-Exp's decoder forms: its residual streams, n-gram embeddings,
+/// indexer, the linear gate's activation, and its mixture of experts (every
+/// layer, softmax routing, a shared expert behind a sigmoid gate).
+fn qwen4_exp_forms(
+    raw: &RawHfConfig,
+    linear_attention: &LinearAttentionConfig,
+    head_dim: u64,
+) -> Result<
+    (
+        DecoderExtensions,
+        (MixtureOfExpertsConfig, ExpertRoutingConfig),
+    ),
+    ProductionIngestionError,
+> {
+    let malformed = |reason: String| ProductionIngestionError::MalformedMetadata { reason };
+    let hyper_connections = HyperConnectionConfig {
+        streams: raw.hc_count.unwrap_or(4),
+        lowrank: raw.hc_lowrank.unwrap_or(320),
+    };
+    let layers = linear_attention.layers.len() as u32;
+    let ple_layers = raw.ple_layer_ids.clone().unwrap_or_default();
+    let ngram_embeddings = if ple_layers.is_empty() {
+        None
+    } else {
+        let mut flags = vec![false; layers as usize];
+        for id in ple_layers {
+            // One-indexed in `config.json`.
+            let slot = id
+                .checked_sub(1)
+                .filter(|slot| *slot < layers)
+                .ok_or_else(|| {
+                    malformed(format!(
+                        "config.json's ple_layer_ids names layer {id} of {layers}"
+                    ))
+                })?;
+            flags[slot as usize] = true;
+        }
+        let eos_token = raw
+            .eos_token_id
+            .as_ref()
+            .and_then(RawEosTokenId::first)
+            .ok_or_else(|| {
+                malformed("config.json enables n-gram embeddings but has no eos_token_id".into())
+            })?;
+        Some(NgramEmbeddingConfig {
+            layers: flags,
+            embedding_dim: raw.ple_embed_dim.or(raw.hidden_size).ok_or_else(|| {
+                malformed("config.json has neither ple_embed_dim nor hidden_size".into())
+            })?,
+            conv_kernel: raw.ple_conv_kernel_size.unwrap_or(4),
+            ngram_size: raw.ngram_size.unwrap_or(3),
+            heads_per_ngram: raw.heads_per_ngram.unwrap_or(8),
+            vocabulary_base: raw.ngram_vocab_size_base.unwrap_or(20_000_000),
+            vocabulary_multiple: raw.make_ngram_vocab_size_divisible_by.unwrap_or(128),
+            seed: raw.seed.unwrap_or(1234),
+            eos_token,
+        })
+    };
+    let indexer = [
+        raw.indexer_n_heads.is_some(),
+        raw.indexer_kv_heads.is_some(),
+        raw.indexer_head_dim.is_some(),
+        raw.indexer_budget.is_some(),
+        raw.indexer_compress_ratio.is_some(),
+    ];
+    let token_selection = if indexer.iter().any(|set| *set) {
+        if !indexer.iter().all(|set| *set) {
+            return Err(malformed(
+                "config.json's indexer_* fields must all be set or all be absent".into(),
+            ));
+        }
+        Some(TokenSelectionConfig {
+            heads: raw.indexer_n_heads.unwrap_or_default(),
+            key_heads: raw.indexer_kv_heads.unwrap_or_default(),
+            head_dim: raw.indexer_head_dim.unwrap_or_default(),
+            budget: raw.indexer_budget.unwrap_or_default(),
+            compress_ratio: raw.indexer_compress_ratio.unwrap_or_default(),
+        })
+    } else {
+        None
+    };
+    // The attention's rotary width must fit the indexer's head (it rotates
+    // its queries and block keys the same way).
+    if let Some(selection) = &token_selection {
+        let factor = rope_parameters(raw)?
+            .get("")
+            .and_then(|flat| flat.partial_rotary_factor)
+            .unwrap_or(1.0);
+        if (head_dim as f64 * factor) as u64 > selection.head_dim {
+            return Err(malformed(
+                "config.json's rotary width does not fit the indexer's head width".into(),
+            ));
+        }
+    }
+    let sigmoid_linear_gate = match raw.output_gate_type.as_deref() {
+        None | Some("silu") => false,
+        Some("sigmoid") => true,
+        Some(other) => {
+            return Err(ProductionIngestionError::UnsupportedFormat {
+                reason: format!("config.json's output_gate_type '{other}' is not supported"),
+            });
+        }
+    };
+    let count = |value: Option<u32>, name: &str| {
+        value.ok_or_else(|| {
+            malformed(format!(
+                "config.json declares a Qwen4-Exp decoder but no '{name}'"
+            ))
+        })
+    };
+    let experts = MixtureOfExpertsConfig {
+        experts: count(raw.num_experts, "num_experts")?,
+        experts_per_token: count(raw.num_experts_per_tok, "num_experts_per_tok")?,
+        expert_intermediate_size: raw.moe_intermediate_size.ok_or_else(|| {
+            malformed(
+                "config.json declares a Qwen4-Exp decoder but no 'moe_intermediate_size'".into(),
+            )
+        })?,
+        shared_expert_intermediate_size: Some(raw.shared_expert_intermediate_size.ok_or_else(
+            || {
+                malformed(
+                    "config.json declares a Qwen4-Exp decoder but no \
+                     'shared_expert_intermediate_size'"
+                        .into(),
+                )
+            },
+        )?),
+        normalize_top_k: raw.norm_topk_prob.unwrap_or(true),
+    };
+    let routing = ExpertRoutingConfig {
+        scoring: ExpertScoring::Softmax,
+        groups: None,
+        routed_scaling_factor: 1.0,
+        selection_bias: false,
+        normalization: None,
+        shared_expert_gated: true,
+    };
+    Ok((
+        DecoderExtensions {
+            hyper_connections: Some(hyper_connections),
+            ngram_embeddings,
+            token_selection,
+            sigmoid_linear_gate,
+        },
+        (experts, routing),
+    ))
 }
 
 /// One layer type's RoPE in `rope_parameters`, or the whole of a flat one.
@@ -963,7 +1168,19 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
     }
 
     let hidden_size = required(raw.hidden_size, "hidden_size")?;
-    let intermediate_size = required(raw.intermediate_size, "intermediate_size")?;
+    // Qwen4-Exp's layers are all mixtures of experts: it declares no dense
+    // MLP width, and the routed experts' width stands in for it.
+    let intermediate_size = if matches!(
+        raw.model_type.as_deref(),
+        Some("qwen4_exp" | "qwen4_exp_text")
+    ) {
+        required(
+            raw.intermediate_size.or(raw.moe_intermediate_size),
+            "moe_intermediate_size",
+        )?
+    } else {
+        required(raw.intermediate_size, "intermediate_size")?
+    };
     let num_hidden_layers = required(raw.num_hidden_layers, "num_hidden_layers")?;
     let num_attention_heads = required(raw.num_attention_heads, "num_attention_heads")?;
     let num_key_value_heads = raw.num_key_value_heads.unwrap_or(num_attention_heads);
@@ -1040,6 +1257,8 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
             | "kimi_k2"
             | "qwen3_5"
             | "qwen3_5_text"
+            | "qwen4_exp"
+            | "qwen4_exp_text"
     );
     let hidden_activation = raw
         .hidden_activation
@@ -1236,7 +1455,10 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
     let routed = routed_experts(&raw, num_hidden_layers)?;
     let (mixture_of_experts, moe_layers, expert_routing) = match routed {
         Some((moe, layers, routing)) => (Some(moe), layers, Some(routing)),
-        None => (mixture_of_experts(&raw)?, None, None),
+        None => match qwen35.as_ref().and_then(|qwen35| qwen35.experts) {
+            Some((moe, routing)) => (Some(moe), None, Some(routing)),
+            None => (mixture_of_experts(&raw)?, None, None),
+        },
     };
     let architecture_config = ModelArchitectureConfig {
         hidden_size,
@@ -1277,6 +1499,10 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
             .is_some_and(|qwen35| qwen35.attention_output_gate),
         // Qwen3.5's RMSNorms scale by `1 + weight`.
         norm_weight_offset: qwen35.as_ref().map(|_| 1.0),
+        decoder_extensions: qwen35
+            .as_ref()
+            .map(|qwen35| qwen35.extensions.clone())
+            .unwrap_or_default(),
         linear_attention: qwen35.map(|qwen35| qwen35.linear_attention),
     };
     architecture_config.validate().map_err(|error| {
@@ -1881,6 +2107,147 @@ mod layered_tests {
                     && layer.num_key_value_heads == 2
                     && layer.sliding_window.is_none())
         );
+    }
+
+    /// A Qwen4-Exp text configuration (`qwen4_exp_text`): residual streams,
+    /// one n-gram embedding layer, the indexer, a sigmoid linear gate and a
+    /// mixture of experts with a gated shared expert.
+    fn qwen4_exp_config() -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["Qwen4ExpForCausalLM"],
+            "model_type": "qwen4_exp_text",
+            "vocab_size": 64, "hidden_size": 32, "num_hidden_layers": 4,
+            "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 16,
+            "linear_num_key_heads": 2, "linear_num_value_heads": 4,
+            "linear_key_head_dim": 8, "linear_value_head_dim": 8,
+            "linear_conv_kernel_dim": 4,
+            "layer_types": ["linear_attention", "indexed_attention",
+                            "linear_attention", "indexed_attention"],
+            "moe_intermediate_size": 12, "shared_expert_intermediate_size": 12,
+            "num_experts": 4, "num_experts_per_tok": 2,
+            "hc_count": 4, "hc_lowrank": 6,
+            "ple_layer_ids": [1], "ple_embed_dim": 32, "ple_conv_kernel_size": 4,
+            "ngram_size": 3, "heads_per_ngram": 8, "ngram_vocab_size_base": 1000,
+            "make_ngram_vocab_size_divisible_by": 128, "seed": 1234,
+            "indexer_n_heads": 2, "indexer_kv_heads": 1, "indexer_head_dim": 8,
+            "indexer_budget": 32, "indexer_compress_ratio": 4,
+            "output_gate_type": "sigmoid",
+            "rope_parameters": {"rope_type": "default", "rope_theta": 100.0,
+                                "partial_rotary_factor": 0.25},
+            "rms_norm_eps": 1e-6, "bos_token_id": 1, "eos_token_id": 2,
+            "tie_word_embeddings": false
+        })
+    }
+
+    #[test]
+    fn qwen4_exp_declares_streams_embeddings_indexer_gate_and_experts() {
+        let parsed = parse(&serde_json::to_vec(&qwen4_exp_config()).unwrap()).unwrap();
+        assert_eq!(parsed.metadata.model_type, "qwen4_exp_text");
+        let config = parsed.architecture_config;
+        assert!(config.attention_output_gate);
+        assert_eq!(config.norm_weight_offset, Some(1.0));
+        assert_eq!(config.hidden_activation.as_deref(), Some("silu"));
+        assert_eq!(config.rope_theta, 100.0);
+        let linear = config.linear_attention.as_ref().unwrap();
+        assert_eq!(linear.layers, [true, false, true, false]);
+        let layout = config.layer_layout.as_ref().unwrap();
+        assert!(
+            layout
+                .iter()
+                .all(|layer| layer.partial_rotary_factor == Some(0.25) && layer.head_dim == 16)
+        );
+        let extensions = &config.decoder_extensions;
+        assert_eq!(
+            extensions.hyper_connections,
+            Some(HyperConnectionConfig {
+                streams: 4,
+                lowrank: 6
+            })
+        );
+        let ngram = extensions.ngram_embeddings.as_ref().unwrap();
+        assert_eq!(ngram.layers, [true, false, false, false]);
+        assert_eq!(
+            (
+                ngram.embedding_dim,
+                ngram.conv_kernel,
+                ngram.ngram_size,
+                ngram.heads_per_ngram
+            ),
+            (32, 4, 3, 8)
+        );
+        assert_eq!(
+            (ngram.vocabulary_base, ngram.seed, ngram.eos_token),
+            (1000, 1234, 2)
+        );
+        assert_eq!(
+            extensions.token_selection,
+            Some(TokenSelectionConfig {
+                heads: 2,
+                key_heads: 1,
+                head_dim: 8,
+                budget: 32,
+                compress_ratio: 4
+            })
+        );
+        assert!(extensions.sigmoid_linear_gate);
+        let moe = config.mixture_of_experts.unwrap();
+        assert_eq!((moe.experts, moe.experts_per_token), (4, 2));
+        assert_eq!(moe.expert_intermediate_size, 12);
+        assert_eq!(moe.shared_expert_intermediate_size, Some(12));
+        assert!(moe.normalize_top_k);
+        let routing = config.expert_routing.unwrap();
+        assert_eq!(routing.scoring, ExpertScoring::Softmax);
+        assert!(routing.shared_expert_gated);
+    }
+
+    #[test]
+    fn qwen4_exp_without_optional_forms_keeps_them_absent() {
+        let mut value = qwen4_exp_config();
+        for key in [
+            "ple_layer_ids",
+            "indexer_n_heads",
+            "indexer_kv_heads",
+            "indexer_head_dim",
+            "indexer_budget",
+            "indexer_compress_ratio",
+            "output_gate_type",
+        ] {
+            value.as_object_mut().unwrap().remove(key);
+        }
+        let config = parse(&serde_json::to_vec(&value).unwrap())
+            .unwrap()
+            .architecture_config;
+        let extensions = config.decoder_extensions;
+        assert!(extensions.hyper_connections.is_some());
+        assert!(extensions.ngram_embeddings.is_none());
+        assert!(extensions.token_selection.is_none());
+        assert!(!extensions.sigmoid_linear_gate);
+    }
+
+    #[test]
+    fn qwen4_exp_refuses_inconsistent_forms() {
+        let refused = |change: fn(&mut serde_json::Value)| {
+            let mut value = qwen4_exp_config();
+            change(&mut value);
+            assert!(
+                parse(&serde_json::to_vec(&value).unwrap()).is_err(),
+                "{value}"
+            );
+        };
+        // A partial indexer, an unknown gate activation, a PLE layer past
+        // the last, and no experts.
+        refused(|value| {
+            value.as_object_mut().unwrap().remove("indexer_budget");
+        });
+        refused(|value| value["output_gate_type"] = "gelu".into());
+        refused(|value| value["ple_layer_ids"] = serde_json::json!([5]));
+        refused(|value| {
+            value.as_object_mut().unwrap().remove("num_experts");
+        });
+        // A budget that is not whole blocks.
+        refused(|value| value["indexer_budget"] = 30.into());
+        // A rotary width wider than the indexer's head.
+        refused(|value| value["rope_parameters"]["partial_rotary_factor"] = 1.0.into());
     }
 
     #[test]

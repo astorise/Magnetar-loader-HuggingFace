@@ -161,6 +161,20 @@ pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionErr
     if name == "lm_head" {
         return Ok("lm_head".to_string());
     }
+    // Qwen4-Exp's final residual-stream mixer: the same weights as a block's
+    // gated residual, without the injection (`support-qwen38-flash-next`).
+    // Their names leave out `proj`: the `gated-residual` operators take
+    // them in checkpoint `[out, in]` order (`weight_layout.rs`).
+    if let Some(field) = name.strip_prefix("model.hyper_connection_mixer.") {
+        return match field {
+            "hc_norm" => Ok("final_hyper.norm".to_string()),
+            "input_mix_weight_down" => Ok("final_hyper.down".to_string()),
+            "input_mix_weight_up" => Ok("final_hyper.up".to_string()),
+            other => Err(ProductionIngestionError::MalformedMetadata {
+                reason: format!("tensor '{raw}' names an unrecognized mixer field '{other}'"),
+            }),
+        };
+    }
     if name == "model.per_layer_projection_norm" {
         return Ok("per_layer_projection_norm".to_string());
     }
@@ -238,6 +252,25 @@ pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionErr
             "self_attn.kv_a_proj_with_mqa" => crate::layered_tensors::LATENT_DOWN_PROJECTION,
             "self_attn.kv_a_layernorm" => "self_attn.kv_a_norm",
             "self_attn.kv_b_proj" => crate::layered_tensors::LATENT_UP_PROJECTION,
+            // Qwen4-Exp's residual streams (`support-qwen38-flash-next`).
+            "attn_hyper_connection.hc_norm" => "attn_hyper.norm",
+            "attn_hyper_connection.input_mix_weight_down" => "attn_hyper.down",
+            "attn_hyper_connection.input_mix_weight_up" => "attn_hyper.up",
+            "attn_hyper_connection.block_inject_weight" => "attn_hyper.inject",
+            "mlp_hyper_connection.hc_norm" => "mlp_hyper.norm",
+            "mlp_hyper_connection.input_mix_weight_down" => "mlp_hyper.down",
+            "mlp_hyper_connection.input_mix_weight_up" => "mlp_hyper.up",
+            "mlp_hyper_connection.block_inject_weight" => "mlp_hyper.inject",
+            // Its token indexer: one projection for the queries and the
+            // single key head, and their norms.
+            "self_attn.indexer.index_qk_proj" => "self_attn.index_qk_proj",
+            "self_attn.indexer.q_layernorm" => "self_attn.index_q_norm",
+            "self_attn.indexer.k_layernorm" => "self_attn.index_k_norm",
+            // A shared expert behind a sigmoid gate.
+            "mlp.shared_expert.gate_proj" => "moe.shared_gate_proj",
+            "mlp.shared_expert.up_proj" => "moe.shared_up_proj",
+            "mlp.shared_expert.down_proj" => "moe.shared_down_proj",
+            "mlp.shared_expert_gate" => "moe.shared_expert_gate",
             // An unscaled router and ungated shared experts.
             "mlp.gate" => "moe.router_proj",
             "mlp.shared_experts.gate_proj" => "moe.shared_gate_proj",
@@ -575,5 +608,74 @@ mod layered_tests {
         }
         assert!(normalize_tensor_name("model.layers.2.mlp.experts.x.up_proj.weight").is_err());
         assert!(normalize_tensor_name("model.layers.2.mlp.experts.3.fc1.weight").is_err());
+    }
+
+    /// `support-qwen38-flash-next`: Qwen4-Exp's residual-stream mixers,
+    /// indexer and shared-expert gate take their own canonical names, none
+    /// of the stream or injection weights with a `proj` that would
+    /// transpose them.
+    #[test]
+    fn normalizes_qwen4_exp_tensors() {
+        let cases = [
+            (
+                "model.layers.3.attn_hyper_connection.hc_norm.weight",
+                "layers.3.attn_hyper.norm",
+            ),
+            (
+                "model.layers.3.attn_hyper_connection.input_mix_weight_down.weight",
+                "layers.3.attn_hyper.down",
+            ),
+            (
+                "model.layers.3.attn_hyper_connection.input_mix_weight_up.weight",
+                "layers.3.attn_hyper.up",
+            ),
+            (
+                "model.layers.3.attn_hyper_connection.block_inject_weight.weight",
+                "layers.3.attn_hyper.inject",
+            ),
+            (
+                "model.layers.3.mlp_hyper_connection.block_inject_weight.weight",
+                "layers.3.mlp_hyper.inject",
+            ),
+            (
+                "model.hyper_connection_mixer.hc_norm.weight",
+                "final_hyper.norm",
+            ),
+            (
+                "model.hyper_connection_mixer.input_mix_weight_up.weight",
+                "final_hyper.up",
+            ),
+            (
+                "model.layers.1.self_attn.indexer.index_qk_proj.weight",
+                "layers.1.self_attn.index_qk_proj",
+            ),
+            (
+                "model.layers.1.self_attn.indexer.k_layernorm.weight",
+                "layers.1.self_attn.index_k_norm",
+            ),
+            (
+                "model.layers.2.mlp.shared_expert.up_proj.weight",
+                "layers.2.moe.shared_up_proj",
+            ),
+            (
+                "model.layers.2.mlp.shared_expert_gate.weight",
+                "layers.2.moe.shared_expert_gate",
+            ),
+        ];
+        for (raw, canonical) in cases {
+            assert_eq!(normalize_tensor_name(raw).unwrap(), canonical, "{raw}");
+        }
+        assert!(normalize_tensor_name("model.hyper_connection_mixer.unknown.weight").is_err());
+        // The shared expert's gate is an `nn.Linear` read as `[in, out]`;
+        // the stream weights keep the checkpoint's order.
+        assert!(crate::weight_layout::is_transposed_projection(
+            "layers.2.moe.shared_expert_gate"
+        ));
+        assert!(!crate::weight_layout::is_transposed_projection(
+            "layers.3.attn_hyper.down"
+        ));
+        assert!(!crate::weight_layout::is_transposed_projection(
+            "final_hyper.up"
+        ));
     }
 }
