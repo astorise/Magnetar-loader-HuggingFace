@@ -66,6 +66,9 @@ pub(crate) const LATENT_UP_PROJECTION: &str = "packed.kv_b_proj";
 /// One routed expert's projection, as discovered: `layers.N.` then this
 /// prefix, the expert's index and `.{gate,up,down}_proj`.
 pub(crate) const EXPERT_PREFIX: &str = "packed.experts.";
+/// One shard of a layer's n-gram embedding table, as discovered: `layers.N.`
+/// then this prefix and the shard's index.
+pub(crate) const NGRAM_SHARD_PREFIX: &str = "packed.ple_table.";
 
 /// How one derived tensor's bytes come from a stored one.
 #[derive(Debug)]
@@ -405,6 +408,7 @@ pub fn derive(
     }
     derive_latent_attention(tensors, config, &mut derived, &mut added)?;
     stack_experts(tensors, config, &mut derived, &mut added)?;
+    stack_ngram_shards(tensors, &mut derived, &mut added)?;
     // GPTQ, AWQ and BitsAndBytes projections are still refused here.
     // FP8 projections can be derived after conversion to their original
     // row-major F32 orientation, before the normal projection transpose.
@@ -618,6 +622,80 @@ fn derive_latent_attention(
 
 /// Stacks each layer's routed experts, stored one by one, in expert order
 /// (see the module documentation).
+/// Stacks each layer's n-gram embedding table shards (`layers.N.
+/// packed.ple_table.K`, in shard order) into `layers.N.ple.table`: the
+/// shards hold consecutive rows of one `[rows, head_dim]` table.
+fn stack_ngram_shards(
+    tensors: &mut Vec<ModelTensorMetadata>,
+    derived: &mut BTreeMap<String, (Derivation, u64)>,
+    added: &mut Vec<ModelTensorMetadata>,
+) -> Result<(), ProductionIngestionError> {
+    let mut stored: BTreeMap<String, BTreeMap<u64, ModelTensorMetadata>> = BTreeMap::new();
+    let mut index = 0;
+    while index < tensors.len() {
+        let parsed = tensors[index]
+            .name
+            .strip_prefix("layers.")
+            .and_then(|rest| rest.split_once('.'))
+            .and_then(|(layer, rest)| Some((layer, rest.strip_prefix(NGRAM_SHARD_PREFIX)?)))
+            .and_then(|(layer, shard)| Some((layer.to_string(), shard.parse::<u64>().ok()?)));
+        let Some((layer, shard)) = parsed else {
+            index += 1;
+            continue;
+        };
+        let tensor = tensors.remove(index);
+        stored.entry(layer).or_default().insert(shard, tensor);
+    }
+    for (layer, shards) in stored {
+        if shards.keys().copied().ne(0..shards.len() as u64) {
+            return Err(malformed(format!(
+                "layer {layer} stores n-gram table shards {:?}, not shards 0 to {}",
+                shards.keys().collect::<Vec<_>>(),
+                shards.len() - 1
+            )));
+        }
+        let first = &shards[&0];
+        let [_, width] = first.shape[..] else {
+            return Err(malformed(format!(
+                "'{}' is not a matrix: {:?}",
+                first.name, first.shape
+            )));
+        };
+        let mut rows = 0;
+        for tensor in shards.values() {
+            if tensor.shape.len() != 2
+                || tensor.shape[1] != width
+                || tensor.storage_dtype != first.storage_dtype
+            {
+                return Err(malformed(format!(
+                    "'{}' is {:?} {:?}, not {:?} rows of {width} like the layer's other shards",
+                    tensor.name, tensor.storage_dtype, tensor.shape, first.storage_dtype
+                )));
+            }
+            rows += tensor.shape[0];
+        }
+        let size = rows * width * element_bytes(first)?;
+        let name = format!("layers.{layer}.ple.table");
+        derived.insert(
+            name.clone(),
+            (
+                Derivation::Stack {
+                    sources: shards.values().map(|tensor| tensor.name.clone()).collect(),
+                },
+                size,
+            ),
+        );
+        added.push(derived_tensor(
+            first,
+            name,
+            vec![rows, width],
+            first.storage_dtype,
+            size,
+        ));
+    }
+    Ok(())
+}
+
 fn stack_experts(
     tensors: &mut Vec<ModelTensorMetadata>,
     config: &ModelArchitectureConfig,
