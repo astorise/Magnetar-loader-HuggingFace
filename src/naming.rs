@@ -289,7 +289,7 @@ pub fn normalize_tensor_name(raw: &str) -> Result<String, ProductionIngestionErr
             "mlp_hyper_connection.block_inject_weight" => "mlp_hyper.inject",
             // Its token indexer: one projection for the queries and the
             // single key head, and their norms.
-            "self_attn.indexer.index_qk_proj" => "self_attn.index_qk_proj",
+            "self_attn.indexer.index_qk_proj" => crate::layered_tensors::INDEX_PROJECTION,
             "self_attn.indexer.q_layernorm" => "self_attn.index_q_norm",
             "self_attn.indexer.k_layernorm" => "self_attn.index_k_norm",
             // Its n-gram embedding: the table in shards of rows, the
@@ -683,7 +683,7 @@ mod layered_tests {
             ),
             (
                 "model.layers.1.self_attn.indexer.index_qk_proj.weight",
-                "layers.1.self_attn.index_qk_proj",
+                "layers.1.packed.index_qk_proj",
             ),
             (
                 "model.layers.1.self_attn.indexer.k_layernorm.weight",

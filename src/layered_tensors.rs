@@ -31,6 +31,9 @@
 //!   `self_attn.v_absorb` (`cache-latent-attention-history`): not
 //!   projections, so they keep the stored `[out, in]` orientation, which is
 //!   what absorbed decode attention multiplies by head.
+//! - A token-indexer layer's fused `index_qk_proj` (the query heads' rows,
+//!   then the key head's) becomes `self_attn.index_q_proj` and
+//!   `self_attn.index_k_proj`.
 //! - Routed experts stored one by one (`mlp.experts.E.{gate,up,down}_proj`)
 //!   are stacked in expert order into `moe.experts_{gate,up,down}_proj`, the
 //!   same layout as the restacked `experts.gate_up_proj` above.
@@ -63,6 +66,9 @@ pub(crate) const QUERY_UP_PROJECTION: &str = "packed.q_b_proj";
 pub(crate) const LATENT_DOWN_PROJECTION: &str = "packed.kv_a_proj_with_mqa";
 /// A latent-attention layer's `kv_b_proj`, as discovered.
 pub(crate) const LATENT_UP_PROJECTION: &str = "packed.kv_b_proj";
+/// A token-indexer layer's fused `index_qk_proj`, as discovered (after
+/// `layers.N.`): the query heads' rows, then the one key head's.
+pub(crate) const INDEX_PROJECTION: &str = "packed.index_qk_proj";
 /// One routed expert's projection, as discovered: `layers.N.` then this
 /// prefix, the expert's index and `.{gate,up,down}_proj`.
 pub(crate) const EXPERT_PREFIX: &str = "packed.experts.";
@@ -407,6 +413,7 @@ pub fn derive(
         ));
     }
     derive_latent_attention(tensors, config, &mut derived, &mut added)?;
+    derive_token_indexers(tensors, config, &mut derived, &mut added)?;
     stack_experts(tensors, config, &mut derived, &mut added)?;
     stack_ngram_shards(tensors, &mut derived, &mut added)?;
     // GPTQ, AWQ and BitsAndBytes projections are still refused here.
@@ -508,8 +515,8 @@ fn take_matrix(
     columns: u64,
 ) -> Result<ModelTensorMetadata, ProductionIngestionError> {
     let name = format!("layers.{layer}.{suffix}");
-    let stored = take(tensors, &name)
-        .ok_or_else(|| malformed(format!("latent-attention layer {layer} has no '{name}'")))?;
+    let stored =
+        take(tensors, &name).ok_or_else(|| malformed(format!("layer {layer} has no '{name}'")))?;
     if stored.shape != [rows, columns] {
         return Err(malformed(format!(
             "'{name}' is {:?}, not [{rows}, {columns}]",
@@ -517,6 +524,54 @@ fn take_matrix(
         )));
     }
     Ok(stored)
+}
+
+/// Splits each token-indexer layer's fused `index_qk_proj` by rows into
+/// `self_attn.index_q_proj` (the query heads) and `self_attn.index_k_proj`
+/// (the key head), so the Model Component applies each by itself.
+fn derive_token_indexers(
+    tensors: &mut Vec<ModelTensorMetadata>,
+    config: &ModelArchitectureConfig,
+    derived: &mut BTreeMap<String, (Derivation, u64)>,
+    added: &mut Vec<ModelTensorMetadata>,
+) -> Result<(), ProductionIngestionError> {
+    let indexed_layers = layers_with(tensors, INDEX_PROJECTION);
+    let Some(selection) = config.decoder_extensions.token_selection else {
+        if let Some(layer) = indexed_layers.first() {
+            return Err(malformed(format!(
+                "layer {layer} stores a token indexer, but config.json declares no indexer"
+            )));
+        }
+        return Ok(());
+    };
+    let queries = u64::from(selection.heads) * selection.head_dim;
+    let keys = u64::from(selection.key_heads) * selection.head_dim;
+    for layer in indexed_layers {
+        let fused = take_matrix(
+            tensors,
+            &layer,
+            INDEX_PROJECTION,
+            queries + keys,
+            config.hidden_size,
+        )?;
+        insert_rows(
+            derived,
+            added,
+            &fused,
+            &layer,
+            "self_attn.index_q_proj",
+            &[(0, queries)],
+        )?;
+        insert_rows(
+            derived,
+            added,
+            &fused,
+            &layer,
+            "self_attn.index_k_proj",
+            &[(queries, keys)],
+        )?;
+    }
+    Ok(())
 }
 
 /// Splits each latent-attention layer's fused projections by rows (see the

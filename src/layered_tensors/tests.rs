@@ -662,3 +662,93 @@ fn inconsistent_ngram_table_shards_are_refused() {
         .is_err()
     );
 }
+
+/// 2 query heads and one key head of 3, hidden 4.
+fn indexer_config() -> ModelArchitectureConfig {
+    ModelArchitectureConfig {
+        hidden_size: 4,
+        num_hidden_layers: 2,
+        decoder_extensions: magnetar_runtime::model::DecoderExtensions {
+            token_selection: Some(magnetar_runtime::model::TokenSelectionConfig {
+                heads: 2,
+                key_heads: 1,
+                head_dim: 3,
+                budget: 8,
+                compress_ratio: 2,
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// The fused `index_qk_proj` (the two query heads' rows, then the key
+/// head's) becomes the query and key projections, each transposed like
+/// every projection.
+#[test]
+fn a_fused_indexer_projection_is_split_into_queries_and_key() {
+    let tensors = [
+        stored_from(
+            "model.layers.1.self_attn.indexer.index_qk_proj.weight",
+            &[9, 4],
+            100.0,
+        ),
+        stored_from(
+            "model.layers.1.self_attn.indexer.k_layernorm.weight",
+            &[3],
+            200.0,
+        ),
+    ];
+    let (inventory, payload) = ingest(&tensors, &indexer_config()).unwrap();
+    let fused = &tensors[0].values;
+    for (name, rows) in [
+        ("index_q_proj", (0..6).collect::<Vec<_>>()),
+        ("index_k_proj", (6..9).collect::<Vec<_>>()),
+    ] {
+        let (shape, values) = read(&inventory, &payload, &format!("layers.1.self_attn.{name}"));
+        assert_eq!(shape, vec![4, rows.len() as u64], "{name}");
+        assert_eq!(values, transposed_rows(fused, 4, &rows), "{name}");
+    }
+    let (shape, values) = read(&inventory, &payload, "layers.1.self_attn.index_k_norm");
+    assert_eq!(shape, vec![3]);
+    assert_eq!(values, tensors[1].values);
+    assert!(
+        !inventory
+            .iter()
+            .any(|tensor| tensor.name.contains("packed.") || tensor.name.ends_with("index_qk_proj"))
+    );
+}
+
+#[test]
+fn an_inconsistent_indexer_projection_is_refused() {
+    // The wrong number of rows for the declared heads.
+    let wrong_rows = [stored_from(
+        "model.layers.0.self_attn.indexer.index_qk_proj.weight",
+        &[8, 4],
+        100.0,
+    )];
+    let reason = ingest(&wrong_rows, &indexer_config())
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        reason.contains("index_qk_proj") && reason.contains("[9, 4]"),
+        "{reason}"
+    );
+    // An indexer the configuration does not declare.
+    let undeclared = [stored_from(
+        "model.layers.0.self_attn.indexer.index_qk_proj.weight",
+        &[9, 4],
+        100.0,
+    )];
+    let config = ModelArchitectureConfig {
+        hidden_size: 4,
+        num_hidden_layers: 1,
+        ..Default::default()
+    };
+    let reason = ingest(&undeclared, &config)
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+    assert!(reason.contains("declares no indexer"), "{reason}");
+}
