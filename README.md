@@ -30,6 +30,14 @@ file in memory. `src/tokenizer.rs` loads a real tokenizer through the
 is the only place in the workspace that depends on it), validating
 vocabulary size against the model's declared `vocab_size`.
 
+`src/fp8.rs` supports E4M3FN weights with F32 block scales and the declared
+dynamic FP8 configuration. It validates weight and scale geometry, including
+scales in another shard, and converts on demand before graph loading. The
+conversion is tested against PyTorch for every byte value and partial tiles;
+tiny synthetic Llama and DeepSeek fixtures match Transformers logits after
+F32 dequantization. Dynamic activation quantization, a released Kimi
+checkpoint and hardware FP8 execution remain unqualified.
+
 Parsing/normalizing a bundle never grants trust: the `ModelManifest` this
 crate produces still goes through `magnetar-runtime`'s own
 `ModelManifest::validate` and `ModelTrustStore::evaluate` like any other

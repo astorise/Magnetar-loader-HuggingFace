@@ -6,12 +6,15 @@
 //! on-demand payload access instead of holding every weight file's bytes
 //! in memory at once.
 
-use magnetar_runtime::model::{ModelDigest, ModelShard, ModelShardId, ModelTensorMetadata};
+use magnetar_runtime::model::{
+    ModelDType, ModelDigest, ModelShard, ModelShardId, ModelTensorMetadata,
+};
 use magnetar_runtime::production_model_ingestion::{
     ProductionArtifactPayloadSource, ProductionIngestionError, ProductionModelSource,
     ProductionPayloadRange,
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
@@ -21,10 +24,44 @@ use std::{
 
 const SINGLE_FILE_NAME: &str = "model.safetensors";
 const INDEX_FILE_NAME: &str = "model.safetensors.index.json";
+// Matches the Safetensors format's practical header limit and prevents an
+// untrusted prefix from requesting an arbitrarily large allocation.
+const MAX_HEADER_BYTES: u64 = 100_000_000;
 
 #[derive(Debug, Deserialize)]
 struct RawShardIndex {
+    #[serde(deserialize_with = "deserialize_unique_weight_map")]
     weight_map: BTreeMap<String, String>,
+}
+
+fn deserialize_unique_weight_map<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct UniqueMap;
+    impl<'de> serde::de::Visitor<'de> for UniqueMap {
+        type Value = BTreeMap<String, String>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a tensor-to-shard object with unique names")
+        }
+        fn visit_map<A>(self, mut source: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut result = BTreeMap::new();
+            while let Some((name, shard)) = source.next_entry::<String, String>()? {
+                if result.insert(name.clone(), shard).is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate tensor '{name}' in weight_map"
+                    )));
+                }
+            }
+            Ok(result)
+        }
+    }
+    deserializer.deserialize_map(UniqueMap)
 }
 
 /// Where one tensor's bytes physically live: which shard file, and the
@@ -218,35 +255,154 @@ fn data_section_start(bytes: &[u8]) -> Result<u64, ProductionIngestionError> {
         })
 }
 
+fn digest_from_hasher(hasher: Sha256) -> ModelDigest {
+    let mut value = String::with_capacity(71);
+    value.push_str("sha256:");
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in hasher.finalize() {
+        value.push(HEX[(byte >> 4) as usize] as char);
+        value.push(HEX[(byte & 15) as usize] as char);
+    }
+    ModelDigest {
+        algorithm: "sha256".into(),
+        value,
+    }
+}
+
+/// Hashes a bounded section without retaining it in memory. The shard hash
+/// includes every byte; the optional tensor hash binds F32/FP8 payloads.
+fn hash_section(
+    file: &mut fs::File,
+    mut length: u64,
+    shard: &mut Sha256,
+    tensor: &mut Option<Sha256>,
+    buffer: &mut [u8],
+) -> std::io::Result<()> {
+    while length != 0 {
+        let count = length.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..count])?;
+        shard.update(&buffer[..count]);
+        if let Some(tensor) = tensor {
+            tensor.update(&buffer[..count]);
+        }
+        length -= count as u64;
+    }
+    Ok(())
+}
+
 fn parse_shard_file(
     path: &std::path::Path,
     shard_id: Option<&str>,
 ) -> Result<
     (
-        Vec<u8>,
+        ModelDigest,
         magnetar_format_safetensors::SafetensorsArtifact,
+        u64,
         u64,
     ),
     ProductionIngestionError,
 > {
-    let bytes = fs::read(path).map_err(|error| ProductionIngestionError::RequiredPartMissing {
+    let unavailable = |error: std::io::Error| ProductionIngestionError::RequiredPartMissing {
         part: format!("{} ({error})", path.display()),
-    })?;
-    let artifact = magnetar_format_safetensors::parse(&bytes).map_err(|error| {
-        ProductionIngestionError::MalformedMetadata {
+    };
+    let mut file = fs::File::open(path).map_err(unavailable)?;
+    let file_length = file.metadata().map_err(unavailable)?.len();
+    let mut prefix = [0_u8; 8];
+    file.read_exact(&mut prefix).map_err(unavailable)?;
+    let header_length = u64::from_le_bytes(prefix);
+    let header_end = header_length
+        .checked_add(8)
+        .filter(|end| *end <= file_length)
+        .filter(|_| header_length <= MAX_HEADER_BYTES)
+        .ok_or_else(|| ProductionIngestionError::MalformedMetadata {
             reason: format!(
-                "{} failed to parse as Safetensors: {error}",
-                shard_id.unwrap_or_else(|| path.to_str().unwrap_or("<weights>"))
+                "{} has an invalid or oversized Safetensors header",
+                path.display()
             ),
+        })?;
+    let header_size =
+        usize::try_from(header_end).map_err(|_| ProductionIngestionError::MalformedMetadata {
+            reason: format!(
+                "{} has a Safetensors header too large for this host",
+                path.display()
+            ),
+        })?;
+    let mut header = Vec::new();
+    header.try_reserve_exact(header_size).map_err(|_| {
+        ProductionIngestionError::MalformedMetadata {
+            reason: format!("{} cannot allocate its Safetensors header", path.display()),
         }
     })?;
-    let start = data_section_start(&bytes)?;
-    Ok((bytes, artifact, start))
+    header.extend_from_slice(&prefix);
+    header.resize(header_size, 0);
+    file.read_exact(&mut header[8..]).map_err(unavailable)?;
+    let mut artifact =
+        magnetar_format_safetensors::parse_header(&header, file_length).map_err(|error| {
+            ProductionIngestionError::MalformedMetadata {
+                reason: format!(
+                    "{} failed to parse as Safetensors: {error}",
+                    shard_id.unwrap_or_else(|| path.to_str().unwrap_or("<weights>"))
+                ),
+            }
+        })?;
+    let start = data_section_start(&header)?;
+
+    // Preserve the same shard and per-tensor digests as parsing the entire
+    // file, but keep memory bounded by the header plus one small buffer.
+    let mut shard_hasher = Sha256::new();
+    shard_hasher.update(&header);
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut order: Vec<usize> = (0..artifact.tensors.len()).collect();
+    order.sort_by_key(|&index| {
+        (
+            artifact.tensors[index].offset_bytes,
+            artifact.tensors[index].size_bytes,
+        )
+    });
+    let mut cursor = 0_u64;
+    for index in order {
+        let tensor = &mut artifact.tensors[index];
+        let offset = tensor.offset_bytes.expect("format parser supplies offsets");
+        let length = tensor.size_bytes.expect("format parser supplies sizes");
+        let gap = offset.checked_sub(cursor).ok_or_else(|| {
+            ProductionIngestionError::MalformedMetadata {
+                reason: "Safetensors tensor ranges overlap".into(),
+            }
+        })?;
+        hash_section(&mut file, gap, &mut shard_hasher, &mut None, &mut buffer)
+            .map_err(unavailable)?;
+        let mut tensor_hasher =
+            matches!(tensor.storage_dtype, ModelDType::F32 | ModelDType::F8E4M3Fn)
+                .then(Sha256::new);
+        hash_section(
+            &mut file,
+            length,
+            &mut shard_hasher,
+            &mut tensor_hasher,
+            &mut buffer,
+        )
+        .map_err(unavailable)?;
+        tensor.digest = tensor_hasher.map(digest_from_hasher);
+        cursor = offset + length;
+    }
+    let tail = (file_length - start).checked_sub(cursor).ok_or_else(|| {
+        ProductionIngestionError::MalformedMetadata {
+            reason: "Safetensors tensor range exceeds its data section".into(),
+        }
+    })?;
+    hash_section(&mut file, tail, &mut shard_hasher, &mut None, &mut buffer)
+        .map_err(unavailable)?;
+    Ok((
+        digest_from_hasher(shard_hasher),
+        artifact,
+        start,
+        file_length,
+    ))
 }
 
 /// Either a plain Safetensors payload source, or one wrapping it to
 /// dequantize GPTQ-quantized (`gptq.rs`), AWQ-quantized (`awq.rs`), or
-/// BitsAndBytes-quantized (`bnb.rs`) projections on demand -- the one
+/// BitsAndBytes-quantized (`bnb.rs`) or block-FP8 (`fp8.rs`) projections on demand -- the one
 /// caller (`discover_and_parse_weights`) picks the variant, so every
 /// other caller (`lib.rs::ingest`) just sees one
 /// [`ProductionArtifactPayloadSource`] regardless of which real bundle
@@ -260,6 +416,7 @@ pub enum WeightsPayloadSource {
     Gptq(crate::gptq::GptqDequantizingPayloadSource<SafetensorsPayloadSource>),
     Awq(crate::awq::AwqDequantizingPayloadSource<SafetensorsPayloadSource>),
     Bnb(crate::bnb::BnbDequantizingPayloadSource<SafetensorsPayloadSource>),
+    Fp8(crate::fp8::DequantizingPayloadSource<SafetensorsPayloadSource>),
 }
 
 impl WeightsPayloadSource {
@@ -271,6 +428,7 @@ impl WeightsPayloadSource {
             Self::Gptq(source) => source.inner(),
             Self::Awq(source) => source.inner(),
             Self::Bnb(source) => source.inner(),
+            Self::Fp8(source) => source.inner(),
         }
     }
 
@@ -282,6 +440,23 @@ impl WeightsPayloadSource {
             Self::Gptq(source) => source.dequantizes(identity),
             Self::Awq(source) => source.dequantizes(identity),
             Self::Bnb(source) => source.dequantizes(identity),
+            Self::Fp8(source) => source.dequantizes(identity),
+        }
+    }
+
+    /// FP8 conversion preserves the stored matrix orientation, unlike some
+    /// other quantizers; its converted bytes can be safely sliced or stacked.
+    pub(crate) fn is_fp8_projection(&self, identity: &str) -> bool {
+        matches!(self, Self::Fp8(source) if source.dequantizes(identity))
+    }
+
+    pub(crate) fn read_fp8_projection(
+        &self,
+        identity: &str,
+    ) -> Result<Option<Vec<u8>>, ProductionIngestionError> {
+        match self {
+            Self::Fp8(source) => source.read_projection(identity),
+            _ => Ok(None),
         }
     }
 }
@@ -296,6 +471,7 @@ impl ProductionArtifactPayloadSource for WeightsPayloadSource {
             Self::Gptq(source) => source.read_payload(range),
             Self::Awq(source) => source.read_payload(range),
             Self::Bnb(source) => source.read_payload(range),
+            Self::Fp8(source) => source.read_payload(range),
         }
     }
 }
@@ -316,8 +492,25 @@ pub type DiscoveredWeights = (
 /// Discovers and parses this bundle's weight files -- single-file
 /// `model.safetensors` if present, else Hugging Face-style sharded
 /// `model.safetensors.index.json` plus `model-*-of-*.safetensors` shards.
+#[cfg(test)]
 pub fn discover_and_parse_weights(
     source: &ProductionModelSource,
+) -> Result<DiscoveredWeights, ProductionIngestionError> {
+    discover_and_parse_weights_with_fp8(source, None)
+}
+
+#[cfg(test)]
+pub fn discover_and_parse_weights_with_fp8(
+    source: &ProductionModelSource,
+    fp8_spec: Option<crate::fp8::CheckpointBlockSpecV1>,
+) -> Result<DiscoveredWeights, ProductionIngestionError> {
+    discover_and_parse_weights_for_model(source, fp8_spec, None)
+}
+
+pub(crate) fn discover_and_parse_weights_for_model(
+    source: &ProductionModelSource,
+    fp8_spec: Option<crate::fp8::CheckpointBlockSpecV1>,
+    model: Option<(&str, u32)>,
 ) -> Result<DiscoveredWeights, ProductionIngestionError> {
     let (mut tensors, shards, mut payload_source) =
         if let Ok(index_path) = source.resolve(INDEX_FILE_NAME) {
@@ -329,6 +522,38 @@ pub fn discover_and_parse_weights(
                 part: format!("{SINGLE_FILE_NAME} or {INDEX_FILE_NAME}"),
             });
         };
+
+    if let Some(("kimi_k2", layer_count)) = model {
+        // The pinned Kimi implementation registers this derived frequency
+        // buffer with `persistent=False`; it recomputes it from the RoPE
+        // configuration. The published shards contain stale BF16 [56]
+        // copies, which upstream does not use. Recognize exactly that
+        // documented checkpoint form and fail closed on other shapes.
+        let mut ignored = std::collections::BTreeSet::new();
+        for tensor in &tensors {
+            if let Some(layer) = tensor
+                .name
+                .strip_prefix("model.layers.")
+                .and_then(|name| name.strip_suffix(".self_attn.rotary_emb.inv_freq"))
+            {
+                let valid_layer = layer.parse::<u32>().is_ok_and(|layer| layer < layer_count);
+                if !valid_layer || tensor.storage_dtype != ModelDType::Bf16 || tensor.shape != [56]
+                {
+                    return Err(ProductionIngestionError::MalformedMetadata {
+                        reason: format!(
+                            "invalid Kimi nonpersistent rotary buffer '{}'",
+                            tensor.name
+                        ),
+                    });
+                }
+                ignored.insert(tensor.name.clone());
+            }
+        }
+        tensors.retain(|tensor| !ignored.contains(&tensor.name));
+        for name in ignored {
+            payload_source.locations.remove(&name);
+        }
+    }
 
     // GPTQ-quantized projections replace their raw `.qweight`/`.qzeros`/
     // `.scales`/`.g_idx` quadruple with one synthesized `<prefix>.weight`
@@ -346,6 +571,16 @@ pub fn discover_and_parse_weights(
     // run here too, while `payload_source` still holds every tensor's
     // real raw-named location, before the renaming loop below.
     let bnb_projections = crate::bnb::extract_bnb_projections(&mut tensors, &payload_source)?;
+    let fp8_projections = crate::fp8::extract_projections(&mut tensors, fp8_spec)?;
+    if !fp8_projections.is_empty()
+        && (!gptq_projections.is_empty()
+            || !awq_projections.is_empty()
+            || !bnb_projections.is_empty())
+    {
+        return Err(ProductionIngestionError::UnsupportedFormat {
+            reason: "mixing FP8 with other quantization methods is not supported".into(),
+        });
+    }
 
     // Real Hugging Face tensor names (e.g. "model.layers.0.self_attn.
     // q_proj.weight") are normalized into the canonical Model Artifact
@@ -370,6 +605,13 @@ pub fn discover_and_parse_weights(
         let canonical = crate::naming::normalize_tensor_name(&tensor.name)?;
         if let Some(location) = payload_source.locations.remove(&tensor.name) {
             renamed_locations.insert(canonical.clone(), location);
+        }
+        // A depthwise `nn.Conv1d` weight `[channels, 1, kernel]` is the
+        // mixer's `[channels, kernel]`: the same bytes.
+        if canonical.ends_with(".linear_attn.conv1d")
+            && let [channels, 1, kernel] = tensor.shape[..]
+        {
+            tensor.shape = vec![channels, kernel];
         }
         tensor.name = canonical;
     }
@@ -421,6 +663,11 @@ pub fn discover_and_parse_weights(
             payload_source,
             bnb_projections,
         ))
+    } else if !fp8_projections.is_empty() {
+        WeightsPayloadSource::Fp8(crate::fp8::DequantizingPayloadSource::new(
+            payload_source,
+            fp8_projections,
+        ))
     } else {
         WeightsPayloadSource::Plain(payload_source)
     };
@@ -437,7 +684,7 @@ fn discover_single_file(
     ),
     ProductionIngestionError,
 > {
-    let (_bytes, artifact, start) = parse_shard_file(path, None)?;
+    let (_digest, artifact, start, _) = parse_shard_file(path, None)?;
     let mut locations = BTreeMap::new();
     let mut tensors = Vec::with_capacity(artifact.tensors.len());
     for tensor in artifact.tensors {
@@ -508,8 +755,8 @@ fn discover_sharded(
                 part: (*shard_filename).clone(),
             }
         })?;
-        let (bytes, artifact, start) = parse_shard_file(&shard_path, Some(shard_filename))?;
-        let digest = ModelDigest::sha256(&bytes);
+        let (digest, artifact, start, size_bytes) =
+            parse_shard_file(&shard_path, Some(shard_filename))?;
         shards.push(ModelShard {
             id: ModelShardId::new((*shard_filename).clone()).map_err(|error| {
                 ProductionIngestionError::MalformedMetadata {
@@ -517,7 +764,7 @@ fn discover_sharded(
                 }
             })?,
             digest,
-            size_bytes: bytes.len() as u64,
+            size_bytes,
             order: order as u32,
         });
         shard_inventories.insert((*shard_filename).clone(), (artifact, start, shard_path));
@@ -535,16 +782,19 @@ fn discover_sharded(
         .map_err(|error| ProductionIngestionError::MalformedMetadata {
             reason: error.to_string(),
         })?;
+    if all_real_tensors.len() != index.weight_map.len() {
+        return Err(ProductionIngestionError::MalformedMetadata {
+            reason: format!(
+                "the shard index lists {} tensors but the shard headers contain {}",
+                index.weight_map.len(),
+                all_real_tensors.len()
+            ),
+        });
+    }
 
     let mut locations = BTreeMap::new();
     let mut tensors = Vec::with_capacity(index.weight_map.len());
-    let mut seen_tensor_names = std::collections::BTreeSet::new();
     for (tensor_name, shard_filename) in &index.weight_map {
-        if !seen_tensor_names.insert(tensor_name.clone()) {
-            return Err(ProductionIngestionError::MalformedMetadata {
-                reason: format!("tensor '{tensor_name}' is mapped more than once in the index"),
-            });
-        }
         let (artifact, start, shard_path) =
             shard_inventories.get(shard_filename).ok_or_else(|| {
                 ProductionIngestionError::MalformedMetadata {
@@ -556,8 +806,9 @@ fn discover_sharded(
             })?;
         let real_entry = artifact
             .tensors
-            .iter()
-            .find(|entry| entry.name == *tensor_name)
+            .binary_search_by(|entry| entry.name.as_str().cmp(tensor_name.as_str()))
+            .ok()
+            .map(|index| &artifact.tensors[index])
             .ok_or_else(|| ProductionIngestionError::MalformedMetadata {
                 reason: format!(
                     "the index maps tensor '{tensor_name}' to shard '{shard_filename}', but \
@@ -597,7 +848,7 @@ fn discover_sharded(
 mod tests {
     use super::*;
     use magnetar_runtime::ModelArtifactSource;
-    use std::io::Write;
+    use std::io::{Seek, SeekFrom, Write};
 
     fn write_safetensors_file(path: &std::path::Path, tensors: &[(&str, &[f32])]) {
         let mut header = serde_json::Map::new();
@@ -623,6 +874,390 @@ mod tests {
             .unwrap();
         file.write_all(&header_bytes).unwrap();
         file.write_all(&data).unwrap();
+    }
+
+    #[test]
+    fn streamed_shard_parsing_preserves_full_and_per_tensor_digests() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("weights.safetensors");
+        let header = br#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[2,6]},"b":{"dtype":"F8_E4M3","shape":[3],"data_offsets":[8,11]},"c":{"dtype":"BF16","shape":[1],"data_offsets":[11,13]}}"#;
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(header).unwrap();
+        file.write_all(&[9, 8, 0, 0, 0x80, 0x3f, 7, 6, 0x38, 0x40, 0x48, 1, 2, 5, 4])
+            .unwrap();
+        drop(file);
+        let bytes = fs::read(&path).unwrap();
+        let expected = magnetar_format_safetensors::parse(&bytes).unwrap();
+        let (digest, actual, start, length) = parse_shard_file(&path, None).unwrap();
+        assert_eq!(digest, ModelDigest::sha256(&bytes));
+        assert_eq!(actual, expected);
+        assert_eq!(start, 8 + header.len() as u64);
+        assert_eq!(length, bytes.len() as u64);
+    }
+
+    #[test]
+    fn shard_index_rejects_duplicate_names_and_unlisted_header_tensors() {
+        let duplicate = br#"{"weight_map":{"a":"one.safetensors","a":"two.safetensors"}}"#;
+        assert!(serde_json::from_slice::<RawShardIndex>(duplicate).is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let shard = directory.path().join("one.safetensors");
+        write_safetensors_file(&shard, &[("a", &[1.0]), ("b", &[2.0])]);
+        let index = directory.path().join(INDEX_FILE_NAME);
+        fs::write(&index, br#"{"weight_map":{"a":"one.safetensors"}}"#).unwrap();
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(directory.path().to_path_buf()),
+            directory.path().to_path_buf(),
+        );
+        assert!(matches!(
+            discover_sharded(&source, &index),
+            Err(ProductionIngestionError::MalformedMetadata { .. })
+        ));
+    }
+
+    #[test]
+    fn pinned_kimi_index_and_real_headers_agree_on_fp8_scales() {
+        use flate2::read::GzDecoder;
+        let mut index_bytes = Vec::new();
+        GzDecoder::new(&include_bytes!("../testdata/kimi-k2/model.safetensors.index.json.gz")[..])
+            .read_to_end(&mut index_bytes)
+            .unwrap();
+        assert_eq!(index_bytes.len(), 12_529_626);
+        assert_eq!(
+            ModelDigest::sha256(&index_bytes).value,
+            "sha256:78957a08bb224e141dbf63feba25b8c6f2b9825a89434054e2856a20c45a1eb7"
+        );
+        let index: RawShardIndex = serde_json::from_slice(&index_bytes).unwrap();
+        assert_eq!(index.weight_map.len(), 139_644);
+        assert_eq!(
+            index
+                .weight_map
+                .values()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            61
+        );
+        let headers: [(&str, &[u8], u64, &str, usize); 3] = [
+            (
+                "model-1-of-61.safetensors",
+                include_bytes!("../testdata/kimi-k2/model-1-of-61.header"),
+                2_846_451_040,
+                "sha256:0b61acf328951e0f0efc25d9cd4b436d4db41e7c31e290b7ad26ddcd647fdecd",
+                8,
+            ),
+            (
+                "model-2-of-61.safetensors",
+                include_bytes!("../testdata/kimi-k2/model-2-of-61.header"),
+                17_066_593_104,
+                "sha256:fbf0cc5f42beeab55a295845073300a1517de025b13ebe33c4902b37017a3c2f",
+                1160,
+            ),
+            (
+                "model-61-of-61.safetensors",
+                include_bytes!("../testdata/kimi-k2/model-61-of-61.header"),
+                19_415_420_696,
+                "sha256:079dcd832e9e1de321e56a8ad3be5ace680dcb6f773d563832b3f0480237565b",
+                1160,
+            ),
+        ];
+        for (filename, header, file_length, digest, expected_fp8) in headers {
+            assert_eq!(ModelDigest::sha256(header).value, digest);
+            let artifact = magnetar_format_safetensors::parse_header(header, file_length).unwrap();
+            let declared: std::collections::BTreeSet<_> = index
+                .weight_map
+                .iter()
+                .filter(|(_, shard)| shard.as_str() == filename)
+                .map(|(name, _)| name.as_str())
+                .collect();
+            let actual: std::collections::BTreeSet<_> = artifact
+                .tensors
+                .iter()
+                .map(|tensor| tensor.name.as_str())
+                .collect();
+            assert_eq!(declared, actual, "{filename}");
+            let by_name: BTreeMap<_, _> = artifact
+                .tensors
+                .iter()
+                .map(|tensor| (tensor.name.as_str(), tensor))
+                .collect();
+            let mut fp8_count = 0;
+            for tensor in &artifact.tensors {
+                if tensor.storage_dtype != ModelDType::F8E4M3Fn {
+                    continue;
+                }
+                fp8_count += 1;
+                assert_eq!(tensor.shape.len(), 2, "{}", tensor.name);
+                let scale_name = format!("{}_scale_inv", tensor.name);
+                let scale = by_name
+                    .get(scale_name.as_str())
+                    .expect("real FP8 weight has a scale");
+                assert_eq!(scale.storage_dtype, ModelDType::F32, "{scale_name}");
+                assert_eq!(
+                    scale.shape,
+                    tensor
+                        .shape
+                        .iter()
+                        .map(|dimension| dimension.div_ceil(128))
+                        .collect::<Vec<_>>(),
+                    "{scale_name}"
+                );
+            }
+            assert_eq!(fp8_count, expected_fp8);
+            let mut inventory = artifact.tensors.clone();
+            let projections = crate::fp8::extract_projections(
+                &mut inventory,
+                Some(crate::fp8::CheckpointBlockSpecV1 {
+                    block_rows: 128,
+                    block_columns: 128,
+                }),
+            )
+            .expect("real Kimi metadata is accepted by FP8 projection extraction");
+            assert_eq!(projections.len(), expected_fp8);
+            assert!(
+                inventory
+                    .iter()
+                    .all(|tensor| tensor.storage_dtype != ModelDType::F8E4M3Fn)
+            );
+        }
+        let scale_names: Vec<_> = index
+            .weight_map
+            .keys()
+            .filter(|name| name.ends_with("_scale_inv"))
+            .collect();
+        assert_eq!(scale_names.len(), 69_608);
+        for scale in scale_names {
+            assert!(
+                index
+                    .weight_map
+                    .contains_key(scale.strip_suffix("_scale_inv").unwrap())
+            );
+        }
+        let unknown: Vec<_> = index
+            .weight_map
+            .keys()
+            .filter(|name| {
+                !name.ends_with("_scale_inv") && !name.ends_with(".self_attn.rotary_emb.inv_freq")
+            })
+            .filter_map(|name| {
+                crate::naming::normalize_tensor_name(name)
+                    .err()
+                    .map(|_| name.clone())
+            })
+            .take(10)
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "unrecognized real Kimi tensor names: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn pinned_olala_header_keeps_separate_geodesic_parameter_identities() {
+        let header = include_bytes!("../testdata/olala-mini/model.header");
+        assert_eq!(
+            ModelDigest::sha256(header).value,
+            "sha256:81df2fdc92cc4faa6c66b9786d2103045c6b466a575b31f97151d64f653882f5"
+        );
+        let artifact = magnetar_format_safetensors::parse_header(header, 13_579_677_592).unwrap();
+        let by_name: BTreeMap<_, _> = artifact
+            .tensors
+            .iter()
+            .map(|tensor| (tensor.name.as_str(), tensor))
+            .collect();
+        let mut canonical_names = std::collections::BTreeSet::new();
+        for layer in 0..36 {
+            for branch in ["mixer", "mlp"] {
+                for parameter in ["scale", "bias", "prosres_scalar"] {
+                    let raw = format!("model.layers.{layer}.geodesic_{branch}.{parameter}");
+                    let tensor = by_name
+                        .get(raw.as_str())
+                        .expect("published geodesic scalar");
+                    assert_eq!(tensor.storage_dtype, ModelDType::F32);
+                    assert!(tensor.shape.is_empty());
+                    let canonical = crate::naming::normalize_tensor_name(&raw).unwrap();
+                    assert_eq!(
+                        canonical,
+                        format!("layers.{layer}.geodesic_{branch}.{parameter}")
+                    );
+                    assert!(canonical_names.insert(canonical));
+                }
+            }
+        }
+        assert_eq!(canonical_names.len(), 216);
+        let scalars = include_bytes!("../testdata/olala-mini/layer0-geodesic.bin");
+        assert_eq!(
+            ModelDigest::sha256(scalars).value,
+            "sha256:b14815a9aad6ed3d1a74a05e4a717eb8a40c9daa24c77078d7f3ec125706d75e"
+        );
+        let values: Vec<_> = scalars
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(f32::from_le_bytes)
+            .collect();
+        assert_eq!(
+            values,
+            [0.80078125, 1.0, 1.546875, 0.31252673, 1.0, 0.36721435]
+        );
+    }
+
+    #[test]
+    fn fp8_without_a_declared_configuration_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = br#"{"model.layers.0.mlp.up_proj.weight":{"dtype":"F8_E4M3","shape":[1,1],"data_offsets":[0,1]}}"#;
+        let mut file = fs::File::create(dir.path().join(SINGLE_FILE_NAME)).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(header).unwrap();
+        file.write_all(&[0x38]).unwrap();
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        assert!(matches!(
+            discover_and_parse_weights(&source),
+            Err(ProductionIngestionError::UnsupportedFormat { .. })
+        ));
+    }
+
+    fn write_raw_tensor(
+        path: &std::path::Path,
+        name: &str,
+        dtype: &str,
+        shape: &[u64],
+        data: &[u8],
+    ) {
+        let header = serde_json::to_vec(&serde_json::json!({
+            name: {"dtype": dtype, "shape": shape, "data_offsets": [0, data.len()]}
+        }))
+        .unwrap();
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header).unwrap();
+        file.write_all(data).unwrap();
+    }
+
+    #[test]
+    fn kimi_nonpersistent_rotary_buffers_are_discarded_only_for_the_known_form() {
+        let directory = tempfile::tempdir().unwrap();
+        let weight = "model.layers.0.mlp.up_proj.weight";
+        let buffer = "model.layers.0.self_attn.rotary_emb.inv_freq";
+        write_raw_tensor(
+            &directory.path().join("weight.safetensors"),
+            weight,
+            "F32",
+            &[1, 1],
+            &1.0_f32.to_le_bytes(),
+        );
+        write_raw_tensor(
+            &directory.path().join("buffer.safetensors"),
+            buffer,
+            "BF16",
+            &[56],
+            &[0; 112],
+        );
+        fs::write(
+            directory.path().join(INDEX_FILE_NAME),
+            serde_json::to_vec(&serde_json::json!({
+                "weight_map": {(weight): "weight.safetensors", (buffer): "buffer.safetensors"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(directory.path().to_path_buf()),
+            directory.path().to_path_buf(),
+        );
+        assert!(discover_and_parse_weights_with_fp8(&source, None).is_err());
+        let (tensors, _, _, _) =
+            discover_and_parse_weights_for_model(&source, None, Some(("kimi_k2", 1))).unwrap();
+        assert_eq!(tensors.len(), 1);
+        assert_eq!(tensors[0].name, "layers.0.mlp.up_proj");
+        assert!(discover_and_parse_weights_for_model(&source, None, Some(("kimi_k2", 0))).is_err());
+    }
+
+    #[test]
+    fn fp8_weight_reads_its_scale_from_a_different_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let weight_name = "model.layers.0.mlp.up_proj.weight";
+        let scale_name = "model.layers.0.mlp.up_proj.weight_scale_inv";
+        write_raw_tensor(
+            &dir.path().join("weight.safetensors"),
+            weight_name,
+            "F8_E4M3",
+            &[2, 3],
+            &[0x38, 0x40, 0x44, 0x48, 0x4a, 0x4c],
+        );
+        let scale_bytes: Vec<u8> = [0.5_f32, 2.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        write_raw_tensor(
+            &dir.path().join("scale.safetensors"),
+            scale_name,
+            "F32",
+            &[1, 2],
+            &scale_bytes,
+        );
+        fs::write(
+            dir.path().join(INDEX_FILE_NAME),
+            serde_json::to_vec(&serde_json::json!({"weight_map": {
+                weight_name: "weight.safetensors", scale_name: "scale.safetensors"
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+            dir.path().to_path_buf(),
+        );
+        let spec = Some(crate::fp8::CheckpointBlockSpecV1 {
+            block_rows: 2,
+            block_columns: 2,
+        });
+        let (tensors, shards, _, payload) =
+            discover_and_parse_weights_with_fp8(&source, spec).unwrap();
+        assert_eq!(shards.len(), 2);
+        assert_eq!(tensors.len(), 1);
+        let tensor = &tensors[0];
+        assert_eq!(tensor.name, "layers.0.mlp.up_proj");
+        assert_eq!(
+            tensor.storage_dtype,
+            magnetar_runtime::model::ModelDType::F32
+        );
+        let bytes = payload
+            .read_payload(&ProductionPayloadRange {
+                identity: tensor.name.clone(),
+                offset: tensor.offset_bytes.unwrap(),
+                length: tensor.size_bytes.unwrap(),
+                digest: None,
+            })
+            .unwrap();
+        let (chunks, remainder) = bytes.as_chunks::<4>();
+        assert!(remainder.is_empty());
+        let actual: Vec<f32> = chunks.iter().copied().map(f32::from_le_bytes).collect();
+        assert_eq!(actual, vec![0.5, 1.0, 6.0, 2.0, 2.5, 12.0]);
+        let mut stored = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("weight.safetensors"))
+            .unwrap();
+        stored.seek(SeekFrom::End(-1)).unwrap();
+        stored.write_all(&[0x00]).unwrap();
+        let error = payload
+            .read_payload(&ProductionPayloadRange {
+                identity: tensor.name.clone(),
+                offset: tensor.offset_bytes.unwrap(),
+                length: tensor.size_bytes.unwrap(),
+                digest: None,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProductionIngestionError::IntegrityMismatch { .. }
+        ));
     }
 
     #[test]

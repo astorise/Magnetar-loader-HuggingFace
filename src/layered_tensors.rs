@@ -405,10 +405,9 @@ pub fn derive(
     }
     derive_latent_attention(tensors, config, &mut derived, &mut added)?;
     stack_experts(tensors, config, &mut derived, &mut added)?;
-    // Every derivation reads its sources' stored bytes. A GPTQ, AWQ or
-    // BitsAndBytes projection's stored bytes are not its values (they are
-    // dequantized on read, GPTQ's and AWQ's already transposed), so
-    // deriving from one is refused rather than cut from packed bytes.
+    // GPTQ, AWQ and BitsAndBytes projections are still refused here.
+    // FP8 projections can be derived after conversion to their original
+    // row-major F32 orientation, before the normal projection transpose.
     for (name, (derivation, _)) in &derived {
         let sources: Vec<&String> = match derivation {
             Derivation::Columns { source, .. } | Derivation::Ranges { source, .. } => {
@@ -419,7 +418,10 @@ pub fn derive(
                 projection, scale, ..
             } => vec![projection, scale],
         };
-        if let Some(source) = sources.into_iter().find(|source| inner.dequantizes(source)) {
+        if let Some(source) = sources
+            .into_iter()
+            .find(|source| inner.dequantizes(source) && !inner.is_fp8_projection(source))
+        {
             return Err(ProductionIngestionError::UnsupportedFormat {
                 reason: format!(
                     "'{name}' would be derived from '{source}', a quantized projection; \
@@ -722,7 +724,26 @@ impl ProductionArtifactPayloadSource for LayeredTensorSource {
             });
         }
         let plain = self.inner.plain();
-        let mut bytes = Vec::with_capacity(usize::try_from(*length).unwrap_or(0));
+        let capacity = usize::try_from(*length)
+            .map_err(|_| malformed(format!("'{}' output is too large", range.identity)))?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(|_| malformed(format!("'{}' output cannot be allocated", range.identity)))?;
+        let append_slice = |output: &mut Vec<u8>, source: &[u8], offset: u64, length: u64| {
+            let start = usize::try_from(offset).ok();
+            let end = offset
+                .checked_add(length)
+                .and_then(|end| usize::try_from(end).ok());
+            let slice = start
+                .zip(end)
+                .and_then(|(start, end)| source.get(start..end))
+                .ok_or_else(|| ProductionIngestionError::PayloadOutOfBounds {
+                    identity: range.identity.clone(),
+                })?;
+            output.extend_from_slice(slice);
+            Ok::<(), ProductionIngestionError>(())
+        };
         match derivation {
             Derivation::Columns {
                 source,
@@ -731,17 +752,39 @@ impl ProductionArtifactPayloadSource for LayeredTensorSource {
                 start,
                 width,
             } => {
-                bytes = plain.read_rows(source, *start, *row_bytes, *width, *rows)?;
+                if let Some(converted) = self.inner.read_fp8_projection(source)? {
+                    for row in 0..*rows {
+                        let offset = row
+                            .checked_mul(*row_bytes)
+                            .and_then(|value| value.checked_add(*start))
+                            .ok_or_else(|| {
+                                malformed(format!("'{}' slice offset overflows", range.identity))
+                            })?;
+                        append_slice(&mut bytes, &converted, offset, *width)?;
+                    }
+                } else {
+                    bytes = plain.read_rows(source, *start, *row_bytes, *width, *rows)?;
+                }
             }
             Derivation::Ranges { source, ranges } => {
-                for (offset, length) in ranges {
-                    bytes.extend(plain.read_within(source, *offset, *length)?);
+                if let Some(converted) = self.inner.read_fp8_projection(source)? {
+                    for (offset, length) in ranges {
+                        append_slice(&mut bytes, &converted, *offset, *length)?;
+                    }
+                } else {
+                    for (offset, length) in ranges {
+                        bytes.extend(plain.read_within(source, *offset, *length)?);
+                    }
                 }
             }
             Derivation::Stack { sources } => {
                 for source in sources {
-                    let total = plain.tensor_length(source)?;
-                    bytes.extend(plain.read_within(source, 0, total)?);
+                    if let Some(converted) = self.inner.read_fp8_projection(source)? {
+                        bytes.extend(converted);
+                    } else {
+                        let total = plain.tensor_length(source)?;
+                        bytes.extend(plain.read_within(source, 0, total)?);
+                    }
                 }
             }
             Derivation::Router {
@@ -753,8 +796,12 @@ impl ProductionArtifactPayloadSource for LayeredTensorSource {
                 factor,
             } => {
                 let read_all = |identity: &str| {
-                    let total = plain.tensor_length(identity)?;
-                    plain.read_within(identity, 0, total)
+                    if let Some(converted) = self.inner.read_fp8_projection(identity)? {
+                        Ok(converted)
+                    } else {
+                        let total = plain.tensor_length(identity)?;
+                        plain.read_within(identity, 0, total)
+                    }
                 };
                 let weights = decode(&read_all(projection)?, *projection_dtype);
                 let scale = decode(&read_all(scale)?, *scale_dtype);
