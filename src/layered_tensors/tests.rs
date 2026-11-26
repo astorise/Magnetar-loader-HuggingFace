@@ -627,6 +627,101 @@ fn ngram_table_shards_are_stacked_in_shard_order() {
     );
 }
 
+/// The stacked table maps as one mapping of its shards, in shard order, with
+/// the bytes `read_payload` returns, and a digest the mapped bytes do not
+/// have is refused.
+#[test]
+fn ngram_table_shards_map_as_one_table() {
+    let config = ModelArchitectureConfig {
+        hidden_size: 3,
+        num_hidden_layers: 2,
+        ..Default::default()
+    };
+    let tensors = [
+        stored_from(
+            "model.layers.1.ple.ple_embedding.ngram_embedding.shard_1.weight",
+            &[3, 2],
+            100.0,
+        ),
+        stored_from(
+            "model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
+            &[3, 2],
+            200.0,
+        ),
+        stored_from("model.layers.1.ple.key_proj.weight", &[6, 4], 300.0),
+        stored_from("model.layers.1.ple.norm_key.weight", &[6], 400.0),
+    ];
+    let (inventory, payload) = ingest(&tensors, &config).unwrap();
+    let range = |name: &str| {
+        let tensor = inventory
+            .iter()
+            .find(|tensor| tensor.name == name)
+            .unwrap_or_else(|| panic!("no tensor '{name}'"));
+        ProductionPayloadRange {
+            identity: tensor.name.clone(),
+            offset: tensor.offset_bytes.unwrap(),
+            length: tensor.size_bytes.unwrap(),
+            digest: tensor.digest.clone(),
+        }
+    };
+
+    let table = range("layers.1.ple.table");
+    let whole = payload.read_payload(&table).unwrap();
+    let mapping = payload
+        .map_payload(&table)
+        .unwrap()
+        .expect("the table maps");
+    assert_eq!(mapping.len(), whole.len() as u64);
+    let mut mapped = vec![0u8; whole.len()];
+    mapping.read_at(0, &mut mapped).unwrap();
+    assert_eq!(mapped, whole, "the mapping is the stacked table's bytes");
+    // A row straddling nothing and a read across the seam between shards.
+    let mut seam = [0u8; 8];
+    mapping
+        .read_at(whole.len() as u64 / 2 - 4, &mut seam)
+        .unwrap();
+    assert_eq!(seam, whole[whole.len() / 2 - 4..whole.len() / 2 + 4]);
+
+    // A tensor stored as it is read maps where it lives.
+    let norm = range("layers.1.ple.norm_key");
+    let mapped_norm = payload
+        .map_payload(&norm)
+        .unwrap()
+        .expect("a stored tensor maps");
+    assert_eq!(mapped_norm.len(), norm.length);
+
+    // The PLE projections keep the checkpoint's `[out, in]` order: stored as
+    // they are read, so they map too.
+    let key = payload
+        .map_payload(&range("layers.1.ple.key"))
+        .unwrap()
+        .expect("a projection kept in stored order maps");
+    assert_eq!(key.len(), range("layers.1.ple.key").length);
+
+    // A declared digest is checked against the mapped bytes.
+    let declared = ProductionPayloadRange {
+        digest: Some(magnetar_runtime::model::ModelDigest::sha256(&whole)),
+        ..table.clone()
+    };
+    assert!(payload.map_payload(&declared).unwrap().is_some());
+    let wrong = ProductionPayloadRange {
+        digest: Some(magnetar_runtime::model::ModelDigest::sha256(
+            b"not the table",
+        )),
+        ..table.clone()
+    };
+    assert!(matches!(
+        payload.map_payload(&wrong),
+        Err(ProductionIngestionError::IntegrityMismatch { .. })
+    ));
+    // A range that is not the table's is out of bounds.
+    let short = ProductionPayloadRange {
+        length: table.length - 4,
+        ..table
+    };
+    assert!(payload.map_payload(&short).is_err());
+}
+
 #[test]
 fn inconsistent_ngram_table_shards_are_refused() {
     let config = ModelArchitectureConfig {
