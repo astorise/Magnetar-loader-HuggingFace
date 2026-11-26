@@ -1,0 +1,8 @@
+schema: spec-driven
+
+context: |
+  Magnetar-loader-HuggingFace is part of Magnetar (https://github.com/astorise/Magnetar), a Rust-first
+  local AI Runtime. A Loader: it reads a model checkpoint's files and hands the Runtime verified
+  tensors, configuration and tokenizer. Its specifications and changes live in this repository. A
+  change that also reaches the Magnetar core is coordinated by a change of the same name in Magnetar,
+  which links to the companion change here.
