@@ -6,12 +6,13 @@
 //! on-demand payload access instead of holding every weight file's bytes
 //! in memory at once.
 
+use crate::mapping::{FileMapping, verify_digest};
 use magnetar_runtime::model::{
     ModelDType, ModelDigest, ModelShard, ModelShardId, ModelTensorMetadata,
 };
 use magnetar_runtime::production_model_ingestion::{
-    ProductionArtifactPayloadSource, ProductionIngestionError, ProductionModelSource,
-    ProductionPayloadRange,
+    MappedPayload, ProductionArtifactPayloadSource, ProductionIngestionError,
+    ProductionModelSource, ProductionPayloadRange,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -20,6 +21,7 @@ use std::{
     fs,
     io::{Read, Seek, SeekFrom},
     path::PathBuf,
+    sync::Arc,
 };
 
 const SINGLE_FILE_NAME: &str = "model.safetensors";
@@ -138,9 +140,49 @@ impl ProductionArtifactPayloadSource for SafetensorsPayloadSource {
         }
         Ok(buffer)
     }
+
+    fn map_payload(
+        &self,
+        range: &ProductionPayloadRange,
+    ) -> Result<Option<Arc<dyn MappedPayload>>, ProductionIngestionError> {
+        let location = self.locations.get(&range.identity).ok_or_else(|| {
+            ProductionIngestionError::PayloadOutOfBounds {
+                identity: range.identity.clone(),
+            }
+        })?;
+        if range.offset != location.offset || range.length != location.length {
+            return Err(ProductionIngestionError::PayloadOutOfBounds {
+                identity: range.identity.clone(),
+            });
+        }
+        let mapping = self.map_tensor(&range.identity)?;
+        if let Some(expected) = &range.digest {
+            verify_digest(&mapping, expected, &range.identity)?;
+        }
+        Ok(Some(Arc::new(mapping)))
+    }
 }
 
 impl SafetensorsPayloadSource {
+    /// Tensor `identity`'s stored bytes, mapped read-only.
+    pub(crate) fn map_tensor(
+        &self,
+        identity: &str,
+    ) -> Result<FileMapping, ProductionIngestionError> {
+        let location = self.locations.get(identity).ok_or_else(|| {
+            ProductionIngestionError::PayloadOutOfBounds {
+                identity: identity.to_string(),
+            }
+        })?;
+        let start = location
+            .data_section_start
+            .checked_add(location.offset)
+            .ok_or_else(|| ProductionIngestionError::PayloadOutOfBounds {
+                identity: identity.to_string(),
+            })?;
+        FileMapping::open(&location.shard_path, start, location.length, identity)
+    }
+
     /// The stored byte length of tensor `identity`.
     pub(crate) fn tensor_length(&self, identity: &str) -> Result<u64, ProductionIngestionError> {
         self.locations
@@ -473,6 +515,18 @@ impl ProductionArtifactPayloadSource for WeightsPayloadSource {
             Self::Bnb(source) => source.read_payload(range),
             Self::Fp8(source) => source.read_payload(range),
         }
+    }
+
+    /// A tensor stored as it is read is mapped; a quantized projection is
+    /// dequantized on read, so it has no bytes to map.
+    fn map_payload(
+        &self,
+        range: &ProductionPayloadRange,
+    ) -> Result<Option<Arc<dyn MappedPayload>>, ProductionIngestionError> {
+        if self.dequantizes(&range.identity) {
+            return Ok(None);
+        }
+        self.plain().map_payload(range)
     }
 }
 

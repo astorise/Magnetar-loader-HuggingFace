@@ -20,9 +20,11 @@
 
 use magnetar_runtime::model::ModelTensorMetadata;
 use magnetar_runtime::production_model_ingestion::{
-    ProductionArtifactPayloadSource, ProductionIngestionError, ProductionPayloadRange,
+    MappedPayload, ProductionArtifactPayloadSource, ProductionIngestionError,
+    ProductionPayloadRange,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 /// Whether `canonical_name` (already normalized -- see `naming.rs`) names
 /// a projection weight this Runtime expects transposed relative to how
@@ -193,6 +195,18 @@ impl<S: ProductionArtifactPayloadSource> ProductionArtifactPayloadSource
         }
         Ok(transposed)
     }
+
+    /// A transposed projection is rewritten on read, so it has no stored
+    /// bytes to map; every other tensor is mapped where it lives.
+    fn map_payload(
+        &self,
+        range: &ProductionPayloadRange,
+    ) -> Result<Option<Arc<dyn MappedPayload>>, ProductionIngestionError> {
+        if self.original_shapes.contains_key(&range.identity) {
+            return Ok(None);
+        }
+        self.inner.map_payload(range)
+    }
 }
 
 #[cfg(test)]
@@ -293,6 +307,67 @@ mod tests {
             tensors[3].digest.is_some(),
             "final_norm's digest is preserved -- it is never transposed"
         );
+    }
+
+    /// A mapping that holds nothing but its length, to tell a forwarded
+    /// request from a refused one.
+    #[derive(Debug)]
+    struct Marker;
+
+    impl MappedPayload for Marker {
+        fn len(&self) -> u64 {
+            7
+        }
+
+        fn read_at(&self, _: u64, _: &mut [u8]) -> Result<(), ProductionIngestionError> {
+            Ok(())
+        }
+
+        fn prefetch(&self, _: &[(u64, u64)]) {}
+    }
+
+    /// A source that maps every range it is asked for.
+    struct MappingSource;
+
+    impl ProductionArtifactPayloadSource for MappingSource {
+        fn read_payload(
+            &self,
+            _: &ProductionPayloadRange,
+        ) -> Result<Vec<u8>, ProductionIngestionError> {
+            Ok(Vec::new())
+        }
+
+        fn map_payload(
+            &self,
+            _: &ProductionPayloadRange,
+        ) -> Result<Option<Arc<dyn MappedPayload>>, ProductionIngestionError> {
+            Ok(Some(Arc::new(Marker)))
+        }
+    }
+
+    /// A projection is rewritten on read, so it has no stored bytes to map;
+    /// every other tensor is the inner source's to map.
+    #[test]
+    fn a_transposed_projection_has_nothing_to_map() {
+        let original = vec![tensor("layers.0.mlp.down_proj", vec![4, 8])];
+        let source = TransposingPayloadSource::new(MappingSource, &original, &BTreeSet::new());
+        let range = |identity: &str| ProductionPayloadRange {
+            identity: identity.into(),
+            offset: 0,
+            length: 0,
+            digest: None,
+        };
+        assert!(
+            source
+                .map_payload(&range("layers.0.mlp.down_proj"))
+                .unwrap()
+                .is_none()
+        );
+        let other = source
+            .map_payload(&range("layers.0.ple.table"))
+            .unwrap()
+            .expect("the inner source maps it");
+        assert_eq!(other.len(), 7);
     }
 
     #[test]

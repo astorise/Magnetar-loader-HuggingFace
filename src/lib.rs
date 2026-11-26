@@ -18,6 +18,8 @@
 //! `ModelTrustStore::evaluate` like any other manifest before Model
 //! Loading may materialize anything from it.
 
+#![deny(unsafe_code)]
+
 mod awq;
 mod bnb;
 mod chat_template;
@@ -26,6 +28,7 @@ mod derived_lm_head;
 pub mod fp8;
 mod gptq;
 mod layered_tensors;
+mod mapping;
 mod naming;
 mod tokenizer;
 mod weight_layout;

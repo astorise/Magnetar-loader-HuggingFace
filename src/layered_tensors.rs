@@ -43,12 +43,15 @@
 //! other weight is fabricated, and no factor is folded into a weight that
 //! a quantized checkpoint could store.
 
+use crate::mapping::{ConcatMapping, verify_digest};
 use crate::weights::WeightsPayloadSource;
 use magnetar_runtime::model::{ModelArchitectureConfig, ModelDType, ModelTensorMetadata};
 use magnetar_runtime::production_model_ingestion::{
-    ProductionArtifactPayloadSource, ProductionIngestionError, ProductionPayloadRange,
+    MappedPayload, ProductionArtifactPayloadSource, ProductionIngestionError,
+    ProductionPayloadRange,
 };
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// `embed_tokens_per_layer`, as discovered.
 pub(crate) const PER_LAYER_EMBEDDING_TABLE: &str = "packed.embed_tokens_per_layer";
@@ -952,6 +955,52 @@ impl ProductionArtifactPayloadSource for LayeredTensorSource {
             )));
         }
         Ok(bytes)
+    }
+
+    /// A tensor stored as one is mapped where it lives; a table stacked from
+    /// shards (`stack_ngram_shards`) is its shards' mappings read as one,
+    /// in shard order. Any other derived tensor is computed, not stored, so
+    /// it has no bytes to map (a caller reads it whole).
+    fn map_payload(
+        &self,
+        range: &ProductionPayloadRange,
+    ) -> Result<Option<Arc<dyn MappedPayload>>, ProductionIngestionError> {
+        let Some((derivation, length)) = self.derived.get(&range.identity) else {
+            return self.inner.map_payload(range);
+        };
+        let Derivation::Stack { sources } = derivation else {
+            return Ok(None);
+        };
+        if range.length != *length || sources.iter().any(|source| self.inner.dequantizes(source)) {
+            return if range.length != *length {
+                Err(ProductionIngestionError::PayloadOutOfBounds {
+                    identity: range.identity.clone(),
+                })
+            } else {
+                Ok(None)
+            };
+        }
+        let plain = self.inner.plain();
+        let parts = sources
+            .iter()
+            .map(|source| {
+                plain
+                    .map_tensor(source)
+                    .map(|mapping| Arc::new(mapping) as Arc<dyn MappedPayload>)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let stacked = ConcatMapping::new(parts);
+        if stacked.len() != *length {
+            return Err(malformed(format!(
+                "'{}' maps {} bytes, not {length}",
+                range.identity,
+                stacked.len()
+            )));
+        }
+        if let Some(expected) = &range.digest {
+            verify_digest(&stacked, expected, &range.identity)?;
+        }
+        Ok(Some(Arc::new(stacked)))
     }
 }
 

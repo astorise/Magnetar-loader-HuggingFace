@@ -14,8 +14,10 @@
 
 use magnetar_runtime::model::ModelTensorMetadata;
 use magnetar_runtime::production_model_ingestion::{
-    ProductionArtifactPayloadSource, ProductionIngestionError, ProductionPayloadRange,
+    MappedPayload, ProductionArtifactPayloadSource, ProductionIngestionError,
+    ProductionPayloadRange,
 };
+use std::sync::Arc;
 
 const LM_HEAD: &str = "lm_head";
 const TOKEN_EMBEDDING: &str = "token_embedding";
@@ -134,6 +136,18 @@ impl<S: ProductionArtifactPayloadSource> ProductionArtifactPayloadSource
         }
         Ok(transposed)
     }
+
+    /// The derived `lm_head` is a transpose computed on read, so it has no
+    /// stored bytes to map; every other tensor is mapped where it lives.
+    fn map_payload(
+        &self,
+        range: &ProductionPayloadRange,
+    ) -> Result<Option<Arc<dyn MappedPayload>>, ProductionIngestionError> {
+        if range.identity == LM_HEAD {
+            return Ok(None);
+        }
+        self.inner.map_payload(range)
+    }
 }
 
 #[cfg(test)]
@@ -232,5 +246,69 @@ mod tests {
             .collect();
         // 3x2 transpose: [[1,4],[2,5],[3,6]]
         assert_eq!(values, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    /// A mapping that holds nothing but its length.
+    #[derive(Debug)]
+    struct Marker;
+
+    impl MappedPayload for Marker {
+        fn len(&self) -> u64 {
+            7
+        }
+
+        fn read_at(&self, _: u64, _: &mut [u8]) -> Result<(), ProductionIngestionError> {
+            Ok(())
+        }
+
+        fn prefetch(&self, _: &[(u64, u64)]) {}
+    }
+
+    /// A source that maps every range it is asked for.
+    struct MappingSource(BTreeMap<String, Vec<u8>>);
+
+    impl ProductionArtifactPayloadSource for MappingSource {
+        fn read_payload(
+            &self,
+            range: &ProductionPayloadRange,
+        ) -> Result<Vec<u8>, ProductionIngestionError> {
+            Ok(self.0[&range.identity].clone())
+        }
+
+        fn map_payload(
+            &self,
+            _: &ProductionPayloadRange,
+        ) -> Result<Option<Arc<dyn MappedPayload>>, ProductionIngestionError> {
+            Ok(Some(Arc::new(Marker)))
+        }
+    }
+
+    /// The derived `lm_head` is computed on read: nothing stored to map.
+    /// Every other tensor is the inner source's to map.
+    #[test]
+    fn the_derived_lm_head_has_nothing_to_map() {
+        let raw = f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let mut token_embedding = tensor("token_embedding", vec![2, 3]);
+        token_embedding.size_bytes = Some(raw.len() as u64);
+        let source = DerivedLmHeadPayloadSource::new(
+            MappingSource(BTreeMap::from([("token_embedding".to_string(), raw)])),
+            &token_embedding,
+        )
+        .unwrap();
+        let range = |identity: &str| ProductionPayloadRange {
+            identity: identity.into(),
+            offset: 0,
+            length: 0,
+            digest: None,
+        };
+        assert!(source.map_payload(&range("lm_head")).unwrap().is_none());
+        assert_eq!(
+            source
+                .map_payload(&range("layers.0.ple.table"))
+                .unwrap()
+                .expect("the inner source maps it")
+                .len(),
+            7
+        );
     }
 }
