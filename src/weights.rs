@@ -76,6 +76,9 @@ struct TensorLocation {
     data_section_start: u64,
     offset: u64,
     length: u64,
+    /// Set by authenticated inspection: checked even if the caller omits a
+    /// range digest. Normal ingestion keeps its historical behavior.
+    authenticated_digest: Option<ModelDigest>,
 }
 
 /// Bounded, on-demand [`ProductionArtifactPayloadSource`] for Hugging
@@ -131,7 +134,17 @@ impl ProductionArtifactPayloadSource for SafetensorsPayloadSource {
                 identity: format!("{}: {error}", range.identity),
             }
         })?;
-        if let Some(expected_digest) = &range.digest {
+        let authenticated = location.authenticated_digest.as_ref();
+        for expected_digest in [
+            authenticated,
+            range
+                .digest
+                .as_ref()
+                .filter(|digest| Some(*digest) != authenticated),
+        ]
+        .into_iter()
+        .flatten()
+        {
             expected_digest.verify_bytes(&buffer).map_err(|error| {
                 ProductionIngestionError::IntegrityMismatch {
                     identity: format!("{}: {error}", range.identity),
@@ -154,6 +167,11 @@ impl ProductionArtifactPayloadSource for SafetensorsPayloadSource {
             return Err(ProductionIngestionError::PayloadOutOfBounds {
                 identity: range.identity.clone(),
             });
+        }
+        // An authenticated mapping could be modified after a one-time digest
+        // check. Require owned, re-verified bytes for this profile instead.
+        if location.authenticated_digest.is_some() {
+            return Ok(None);
         }
         let mapping = self.map_tensor(&range.identity)?;
         if let Some(expected) = &range.digest {
@@ -359,7 +377,7 @@ fn parse_shards(names: &[&String], paths: &[PathBuf]) -> Vec<ParsedShard> {
         return paths
             .iter()
             .zip(names)
-            .map(|(path, name)| parse_shard_file(path, Some(name)))
+            .map(|(path, name)| parse_shard_file(path, Some(name), false))
             .collect();
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -371,7 +389,7 @@ fn parse_shards(names: &[&String], paths: &[PathBuf]) -> Vec<ParsedShard> {
                 loop {
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(path) = paths.get(index) else { break };
-                    let parsed = parse_shard_file(path, Some(names[index]));
+                    let parsed = parse_shard_file(path, Some(names[index]), false);
                     *slots[index]
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(parsed);
@@ -392,6 +410,7 @@ fn parse_shards(names: &[&String], paths: &[PathBuf]) -> Vec<ParsedShard> {
 fn parse_shard_file(
     path: &std::path::Path,
     shard_id: Option<&str>,
+    hash_all_tensors: bool,
 ) -> Result<
     (
         ModelDigest,
@@ -470,9 +489,9 @@ fn parse_shard_file(
         })?;
         hash_section(&mut file, gap, &mut shard_hasher, &mut None, &mut buffer)
             .map_err(unavailable)?;
-        let mut tensor_hasher =
-            matches!(tensor.storage_dtype, ModelDType::F32 | ModelDType::F8E4M3Fn)
-                .then(Sha256::new);
+        let mut tensor_hasher = (hash_all_tensors
+            || matches!(tensor.storage_dtype, ModelDType::F32 | ModelDType::F8E4M3Fn))
+        .then(Sha256::new);
         hash_section(
             &mut file,
             length,
@@ -625,6 +644,32 @@ pub fn inspect_safetensors_file(
 ) -> Result<RawSafetensors, ProductionIngestionError> {
     let path = source.resolve(relative)?;
     let (tensors, shards, payloads, digest) = discover_single_file(&path)?;
+    Ok(RawSafetensors {
+        tensors,
+        shards,
+        payloads,
+        single_file_digest: Some(digest),
+    })
+}
+
+/// Inspect one caller-authorized Safetensors file and bind every payload to
+/// an independently trusted whole-file digest. Per-tensor digests, including
+/// F16 and BF16, are computed in the same streaming pass as the file digest.
+/// Later reads always check the recorded original bytes, even if a caller
+/// omits `ProductionPayloadRange::digest`; mappings are unavailable for this
+/// profile because a mutable file could change after mapping verification.
+pub fn inspect_authenticated_safetensors_file(
+    source: &ProductionModelSource,
+    relative: &str,
+    expected: &ModelDigest,
+) -> Result<RawSafetensors, ProductionIngestionError> {
+    let path = source.resolve(relative)?;
+    let (tensors, shards, payloads, digest) = discover_single_file_with_hashing(&path, true)?;
+    if &digest != expected {
+        return Err(ProductionIngestionError::IntegrityMismatch {
+            identity: relative.into(),
+        });
+    }
     Ok(RawSafetensors {
         tensors,
         shards,
@@ -859,7 +904,22 @@ fn discover_single_file(
     ),
     ProductionIngestionError,
 > {
-    let (digest, artifact, start, _) = parse_shard_file(path, None)?;
+    discover_single_file_with_hashing(path, false)
+}
+
+fn discover_single_file_with_hashing(
+    path: &std::path::Path,
+    hash_all_tensors: bool,
+) -> Result<
+    (
+        Vec<ModelTensorMetadata>,
+        Vec<ModelShard>,
+        SafetensorsPayloadSource,
+        ModelDigest,
+    ),
+    ProductionIngestionError,
+> {
+    let (digest, artifact, start, _) = parse_shard_file(path, None, hash_all_tensors)?;
     let mut locations = BTreeMap::new();
     let mut tensors = Vec::with_capacity(artifact.tensors.len());
     for tensor in artifact.tensors {
@@ -878,11 +938,16 @@ fn discover_single_file(
                 data_section_start: start,
                 offset,
                 length,
+                authenticated_digest: if hash_all_tensors {
+                    tensor.digest.clone()
+                } else {
+                    None
+                },
             },
         );
-        // Any digest here was measured while reading this file, not
-        // declared by Safetensors. It detects later byte changes but does
-        // not authenticate the checkpoint.
+        // These digests are measured while reading the file, not declared
+        // by Safetensors. They authenticate later payloads only when the
+        // caller also verifies the whole-file digest against a trusted value.
         tensors.push(tensor);
     }
     Ok((
@@ -1021,6 +1086,7 @@ fn discover_sharded(
                 data_section_start: *start,
                 offset,
                 length,
+                authenticated_digest: None,
             },
         );
         let mut tensor = real_entry.clone();
@@ -1081,11 +1147,94 @@ mod tests {
         drop(file);
         let bytes = fs::read(&path).unwrap();
         let expected = magnetar_format_safetensors::parse(&bytes).unwrap();
-        let (digest, actual, start, length) = parse_shard_file(&path, None).unwrap();
+        let (digest, actual, start, length) = parse_shard_file(&path, None, false).unwrap();
         assert_eq!(digest, ModelDigest::sha256(&bytes));
         assert_eq!(actual, expected);
         assert_eq!(start, 8 + header.len() as u64);
         assert_eq!(length, bytes.len() as u64);
+    }
+
+    #[test]
+    fn authenticated_inspection_binds_half_precision_payloads_to_the_file_digest() {
+        use magnetar_format_safetensors::{TensorToSerialize, serialize};
+        use std::io::{Seek, SeekFrom};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("head.safetensors");
+        let f16 = [0_u8, 0x3c, 0, 0xc0];
+        let bf16 = [0x80_u8, 0x3f];
+        let bytes = serialize(
+            &[
+                TensorToSerialize {
+                    name: "f16",
+                    dtype: ModelDType::F16,
+                    shape: vec![2],
+                    data: &f16,
+                },
+                TensorToSerialize {
+                    name: "bf16",
+                    dtype: ModelDType::Bf16,
+                    shape: vec![1],
+                    data: &bf16,
+                },
+            ],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let source = ProductionModelSource::authorized_local_bundle(
+            ModelArtifactSource::LocalPath(directory.path().to_path_buf()),
+            directory.path().to_path_buf(),
+        );
+        assert!(matches!(
+            inspect_authenticated_safetensors_file(
+                &source,
+                "head.safetensors",
+                &ModelDigest::sha256(b"wrong")
+            ),
+            Err(ProductionIngestionError::IntegrityMismatch { .. })
+        ));
+        let expected = ModelDigest::sha256(&bytes);
+        let inspected =
+            inspect_authenticated_safetensors_file(&source, "head.safetensors", &expected).unwrap();
+        assert_eq!(inspected.single_file_digest, Some(expected));
+        for tensor in &inspected.tensors {
+            let original = if tensor.name == "f16" {
+                &f16[..]
+            } else {
+                &bf16[..]
+            };
+            assert_eq!(tensor.digest.as_ref(), Some(&ModelDigest::sha256(original)));
+        }
+        let tensor = inspected
+            .tensors
+            .iter()
+            .find(|tensor| tensor.name == "f16")
+            .unwrap();
+        let range = ProductionPayloadRange {
+            identity: tensor.name.clone(),
+            offset: tensor.offset_bytes.unwrap(),
+            length: tensor.size_bytes.unwrap(),
+            digest: None,
+        };
+        assert_eq!(inspected.payloads.read_payload(&range).unwrap(), f16);
+        assert!(inspected.payloads.map_payload(&range).unwrap().is_none());
+        let mut wrong_range = range.clone();
+        wrong_range.digest = Some(ModelDigest::sha256(b"wrong tensor"));
+        assert!(matches!(
+            inspected.payloads.read_payload(&wrong_range),
+            Err(ProductionIngestionError::IntegrityMismatch { .. })
+        ));
+        let header = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(8 + header + range.offset))
+            .unwrap();
+        file.write_all(&[0x42]).unwrap();
+        drop(file);
+        assert!(matches!(
+            inspected.payloads.read_payload(&range),
+            Err(ProductionIngestionError::IntegrityMismatch { .. })
+        ));
     }
 
     #[test]
