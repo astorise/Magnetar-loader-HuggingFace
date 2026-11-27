@@ -30,6 +30,17 @@ file in memory. `src/tokenizer.rs` loads a real tokenizer through the
 is the only place in the workspace that depends on it), validating
 vocabulary size against the model's declared `vocab_size`.
 
+`discover_raw_safetensors` exposes the original tensor names, shapes, storage
+types and bounded payload access for conventional single-file or indexed
+sharded checkpoints. `inspect_safetensors_file` does the same for an explicitly
+named file inside an authorized bundle, such as an adapter checkpoint. These
+APIs do not apply decoder-specific naming or transposition, decode weights,
+or establish trust: the caller must authenticate the artifact and validate
+the model-specific inventory before using the bytes. Observed file or shard
+digests can be compared with an independently trusted digest; computing one
+is not itself authentication. Source files must remain unchanged while their
+payloads are read.
+
 `src/fp8.rs` supports E4M3FN weights with F32 block scales and the declared
 dynamic FP8 configuration. It validates weight and scale geometry, including
 scales in another shard, and converts on demand before graph loading. The
