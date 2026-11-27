@@ -30,6 +30,7 @@ mod gptq;
 mod layered_tensors;
 mod mapping;
 mod naming;
+pub mod nemotron_profile;
 mod tokenizer;
 mod weight_layout;
 mod weights;
