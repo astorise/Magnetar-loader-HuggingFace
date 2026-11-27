@@ -1148,6 +1148,18 @@ pub fn parse(bytes: &[u8]) -> Result<NormalizedHfConfig, ProductionIngestionErro
     if let Some(architectures) = outer_architectures {
         raw.architectures = architectures;
     }
+    // These hybrid families have ordered recurrent/attention blocks and
+    // family-specific expert semantics not represented by this ingestor yet.
+    // In particular, their similarly named MoE fields are not the generic
+    // DeepSeek defaults below. Refuse the entire profile until ingestion can
+    // carry and validate all of those semantics to its Component.
+    if let Some(family @ ("olala" | "nemotron_h")) = raw.model_type.as_deref() {
+        return Err(ProductionIngestionError::UnsupportedFormat {
+            reason: format!(
+                "{family} hybrid recurrent/attention configuration is not supported by this ingestor"
+            ),
+        });
+    }
     // MistralConfig's upstream default is 4096 when the field is absent;
     // an explicit null, as in v0.2/v0.3, disables sliding attention.
     if raw.model_type.as_deref() == Some("mistral") && window_missing {
@@ -1583,6 +1595,24 @@ mod tests {
         assert_eq!(config.eos_token_id, Some(151645));
         assert_eq!(normalized.metadata.model_type, "qwen2");
         assert_eq!(normalized.metadata.torch_dtype.as_deref(), Some("bfloat16"));
+    }
+
+    #[test]
+    fn refuses_unmodeled_hybrid_families_before_applying_decoder_defaults() {
+        for family in ["olala", "nemotron_h"] {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&qwen2_0_5b_config()).unwrap();
+            value["model_type"] = family.into();
+            value["hybrid_override_pattern"] = "M*".into();
+            value["layers_config"] = "MV".into();
+            assert!(
+                matches!(
+                    parse(&serde_json::to_vec(&value).unwrap()),
+                    Err(ProductionIngestionError::UnsupportedFormat { .. })
+                ),
+                "{family} must not be ingested as a generic decoder"
+            );
+        }
     }
 
     #[test]
