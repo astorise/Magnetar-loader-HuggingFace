@@ -469,15 +469,18 @@ fn qwen4_exp_forms(
         )?),
         normalize_top_k: raw.norm_topk_prob.unwrap_or(true),
     };
-    Ok((
-        DecoderExtensions {
-            hyper_connections: Some(hyper_connections),
-            ngram_embeddings,
-            token_selection,
-            sigmoid_linear_gate,
-        },
-        experts,
-    ))
+    // New decoder forms must default to absent instead of preventing this
+    // Qwen profile from compiling against a newer Runtime. On older Runtime
+    // versions all fields happen to be specified, making the update redundant.
+    #[allow(clippy::needless_update)]
+    let extensions = DecoderExtensions {
+        hyper_connections: Some(hyper_connections),
+        ngram_embeddings,
+        token_selection,
+        sigmoid_linear_gate,
+        ..Default::default()
+    };
+    Ok((extensions, experts))
 }
 
 /// One layer type's RoPE in `rope_parameters`, or the whole of a flat one.
