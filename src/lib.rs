@@ -43,7 +43,9 @@ pub use tokenizer::{
     required_special_token_kinds,
 };
 pub use weight_layout::{TransposingPayloadSource, swap_declared_projection_shapes};
-pub use weights::SafetensorsPayloadSource;
+pub use weights::{
+    RawSafetensors, SafetensorsPayloadSource, discover_raw_safetensors, inspect_safetensors_file,
+};
 
 use magnetar_runtime::model::{
     ModelArtifactId, ModelArtifactKind, ModelArtifactPart, ModelDType, ModelDigest, ModelManifest,

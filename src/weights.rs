@@ -600,6 +600,73 @@ pub type DiscoveredWeights = (
     WeightsPayloadSource,
 );
 
+/// Parsed checkpoint-order tensor metadata and bounded access to its bytes.
+/// This is not a trusted Model Artifact: callers must authenticate the
+/// checkpoint and validate its model-specific tensor inventory before use.
+/// The caller must keep the source files unchanged while the payloads are read;
+/// measured file digests describe inspection, not a locked file snapshot.
+#[derive(Debug)]
+pub struct RawSafetensors {
+    pub tensors: Vec<ModelTensorMetadata>,
+    pub shards: Vec<ModelShard>,
+    pub payloads: SafetensorsPayloadSource,
+    /// Observed whole-file digest for a single file; compare it with an
+    /// independently authorized digest. Indexed shards carry their own
+    /// observed digests in `shards`. This value is not a trust decision.
+    pub single_file_digest: Option<ModelDigest>,
+}
+
+/// Inspect a caller-selected Safetensors file within an authorized bundle.
+/// Names, shapes and storage dtypes remain exactly as declared in the file;
+/// no model-specific renaming, transposition or dequantization is performed.
+pub fn inspect_safetensors_file(
+    source: &ProductionModelSource,
+    relative: &str,
+) -> Result<RawSafetensors, ProductionIngestionError> {
+    let path = source.resolve(relative)?;
+    let (tensors, shards, payloads, digest) = discover_single_file(&path)?;
+    Ok(RawSafetensors {
+        tensors,
+        shards,
+        payloads,
+        single_file_digest: Some(digest),
+    })
+}
+
+/// Discover conventional single-file or indexed sharded weights without
+/// changing tensor names or their physical checkpoint layout.
+pub fn discover_raw_safetensors(
+    source: &ProductionModelSource,
+) -> Result<RawSafetensors, ProductionIngestionError> {
+    let (tensors, shards, payloads, single_file_digest) = match source.resolve(INDEX_FILE_NAME) {
+        Ok(index) => {
+            let (tensors, shards, payloads) = discover_sharded(source, &index)?;
+            (tensors, shards, payloads, None)
+        }
+        Err(ProductionIngestionError::RequiredPartMissing { .. }) => {
+            match source.resolve(SINGLE_FILE_NAME) {
+                Ok(path) => {
+                    let (tensors, shards, payloads, digest) = discover_single_file(&path)?;
+                    (tensors, shards, payloads, Some(digest))
+                }
+                Err(ProductionIngestionError::RequiredPartMissing { .. }) => {
+                    return Err(ProductionIngestionError::RequiredPartMissing {
+                        part: format!("{SINGLE_FILE_NAME} or {INDEX_FILE_NAME}"),
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(RawSafetensors {
+        tensors,
+        shards,
+        payloads,
+        single_file_digest,
+    })
+}
+
 /// Discovers and parses this bundle's weight files -- single-file
 /// `model.safetensors` if present, else Hugging Face-style sharded
 /// `model.safetensors.index.json` plus `model-*-of-*.safetensors` shards.
@@ -623,16 +690,12 @@ pub(crate) fn discover_and_parse_weights_for_model(
     fp8_spec: Option<crate::fp8::CheckpointBlockSpecV1>,
     model: Option<(&str, u32)>,
 ) -> Result<DiscoveredWeights, ProductionIngestionError> {
-    let (mut tensors, shards, mut payload_source) =
-        if let Ok(index_path) = source.resolve(INDEX_FILE_NAME) {
-            discover_sharded(source, &index_path)?
-        } else if let Ok(single_path) = source.resolve(SINGLE_FILE_NAME) {
-            discover_single_file(&single_path)?
-        } else {
-            return Err(ProductionIngestionError::RequiredPartMissing {
-                part: format!("{SINGLE_FILE_NAME} or {INDEX_FILE_NAME}"),
-            });
-        };
+    let RawSafetensors {
+        mut tensors,
+        shards,
+        payloads: mut payload_source,
+        ..
+    } = discover_raw_safetensors(source)?;
 
     if let Some(("kimi_k2", layer_count)) = model {
         // The pinned Kimi implementation registers this derived frequency
@@ -792,10 +855,11 @@ fn discover_single_file(
         Vec<ModelTensorMetadata>,
         Vec<ModelShard>,
         SafetensorsPayloadSource,
+        ModelDigest,
     ),
     ProductionIngestionError,
 > {
-    let (_digest, artifact, start, _) = parse_shard_file(path, None)?;
+    let (digest, artifact, start, _) = parse_shard_file(path, None)?;
     let mut locations = BTreeMap::new();
     let mut tensors = Vec::with_capacity(artifact.tensors.len());
     for tensor in artifact.tensors {
@@ -816,14 +880,17 @@ fn discover_single_file(
                 length,
             },
         );
-        // No content digest: neither the Safetensors header nor a
-        // single-file bundle's own metadata declares a per-tensor digest
-        // -- inventing one here would let it silently "verify" against
-        // itself, proving nothing (`ModelTensorMetadata::digest`'s own
-        // "None means unknown" precedent).
+        // Any digest here was measured while reading this file, not
+        // declared by Safetensors. It detects later byte changes but does
+        // not authenticate the checkpoint.
         tensors.push(tensor);
     }
-    Ok((tensors, Vec::new(), SafetensorsPayloadSource { locations }))
+    Ok((
+        tensors,
+        Vec::new(),
+        SafetensorsPayloadSource { locations },
+        digest,
+    ))
 }
 
 fn discover_sharded(
