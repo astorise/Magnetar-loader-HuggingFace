@@ -192,6 +192,11 @@ impl SafetensorsPayloadSource {
                 identity: identity.to_string(),
             }
         })?;
+        if location.authenticated_digest.is_some() {
+            return Err(ProductionIngestionError::UnsupportedFormat {
+                reason: format!("authenticated tensor '{identity}' cannot be memory mapped"),
+            });
+        }
         let start = location
             .data_section_start
             .checked_add(location.offset)
@@ -251,6 +256,20 @@ impl SafetensorsPayloadSource {
         if width == 0 {
             return Ok(buffer);
         }
+        if location.authenticated_digest.is_some() {
+            let verified = self.read_payload(&ProductionPayloadRange {
+                identity: identity.into(),
+                offset: location.offset,
+                length: location.length,
+                digest: None,
+            })?;
+            for (row, slice) in buffer.chunks_exact_mut(width).enumerate() {
+                let start =
+                    usize::try_from(offset + row as u64 * stride).map_err(|_| out_of_bounds())?;
+                slice.copy_from_slice(&verified[start..start + width]);
+            }
+            return Ok(buffer);
+        }
         let mut file = fs::File::open(&location.shard_path).map_err(unavailable)?;
         for (row, slice) in buffer.chunks_exact_mut(width).enumerate() {
             file.seek(SeekFrom::Start(start + row as u64 * stride))
@@ -278,6 +297,17 @@ impl SafetensorsPayloadSource {
             .is_none_or(|end| end > location.length)
         {
             return Err(out_of_bounds());
+        }
+        if location.authenticated_digest.is_some() {
+            let verified = self.read_payload(&ProductionPayloadRange {
+                identity: identity.into(),
+                offset: location.offset,
+                length: location.length,
+                digest: None,
+            })?;
+            let start = usize::try_from(offset).map_err(|_| out_of_bounds())?;
+            let length = usize::try_from(length).map_err(|_| out_of_bounds())?;
+            return Ok(verified[start..start + length].to_vec());
         }
         let start = location
             .data_section_start
@@ -369,7 +399,7 @@ type ParsedShard = Result<
 /// gains nothing; a checkpoint of many shards reads and hashes them
 /// side by side (measured with a release build on this development VM: one
 /// core hashes about 1 GB/s, four cores about 2.2 GB/s from a cold cache).
-fn parse_shards(names: &[&String], paths: &[PathBuf]) -> Vec<ParsedShard> {
+fn parse_shards(names: &[&String], paths: &[PathBuf], hash_all_tensors: bool) -> Vec<ParsedShard> {
     let workers = std::thread::available_parallelism()
         .map_or(1, usize::from)
         .min(paths.len());
@@ -377,7 +407,7 @@ fn parse_shards(names: &[&String], paths: &[PathBuf]) -> Vec<ParsedShard> {
         return paths
             .iter()
             .zip(names)
-            .map(|(path, name)| parse_shard_file(path, Some(name), false))
+            .map(|(path, name)| parse_shard_file(path, Some(name), hash_all_tensors))
             .collect();
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -389,7 +419,7 @@ fn parse_shards(names: &[&String], paths: &[PathBuf]) -> Vec<ParsedShard> {
                 loop {
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(path) = paths.get(index) else { break };
-                    let parsed = parse_shard_file(path, Some(names[index]), false);
+                    let parsed = parse_shard_file(path, Some(names[index]), hash_all_tensors);
                     *slots[index]
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(parsed);
@@ -712,6 +742,26 @@ pub fn discover_raw_safetensors(
     })
 }
 
+/// Inspect indexed shards against independently authorized whole-file hashes.
+/// The expected map must name exactly the shards used by the index. Every
+/// tensor, including F16/BF16, is hashed during the bounded shard read;
+/// subsequent payload reads re-verify those bytes and cannot be memory mapped.
+/// The index is cross-checked against every authenticated shard inventory.
+pub fn discover_authenticated_sharded_safetensors(
+    source: &ProductionModelSource,
+    expected_shards: &BTreeMap<String, ModelDigest>,
+) -> Result<RawSafetensors, ProductionIngestionError> {
+    let index = source.resolve(INDEX_FILE_NAME)?;
+    let (tensors, shards, payloads) =
+        discover_sharded_with_expected(source, &index, Some(expected_shards))?;
+    Ok(RawSafetensors {
+        tensors,
+        shards,
+        payloads,
+        single_file_digest: None,
+    })
+}
+
 /// Discovers and parses this bundle's weight files -- single-file
 /// `model.safetensors` if present, else Hugging Face-style sharded
 /// `model.safetensors.index.json` plus `model-*-of-*.safetensors` shards.
@@ -969,6 +1019,21 @@ fn discover_sharded(
     ),
     ProductionIngestionError,
 > {
+    discover_sharded_with_expected(source, index_path, None)
+}
+
+fn discover_sharded_with_expected(
+    source: &ProductionModelSource,
+    index_path: &std::path::Path,
+    expected_shards: Option<&BTreeMap<String, ModelDigest>>,
+) -> Result<
+    (
+        Vec<ModelTensorMetadata>,
+        Vec<ModelShard>,
+        SafetensorsPayloadSource,
+    ),
+    ProductionIngestionError,
+> {
     let index_bytes =
         fs::read(index_path).map_err(|error| ProductionIngestionError::RequiredPartMissing {
             part: format!("{} ({error})", index_path.display()),
@@ -982,6 +1047,16 @@ fn discover_sharded(
     let mut shard_filenames: Vec<&String> = index.weight_map.values().collect();
     shard_filenames.sort();
     shard_filenames.dedup();
+    if expected_shards.is_some_and(|expected| {
+        expected.len() != shard_filenames.len()
+            || shard_filenames
+                .iter()
+                .any(|name| !expected.contains_key(*name))
+    }) {
+        return Err(ProductionIngestionError::IntegrityMismatch {
+            identity: "Safetensors index shard set".into(),
+        });
+    }
 
     let mut shards = Vec::with_capacity(shard_filenames.len());
     let mut shard_inventories: BTreeMap<
@@ -1005,7 +1080,7 @@ fn discover_sharded(
     // Reading and hashing a shard is the one full read of the weights a load
     // makes before it maps or stages anything: the shards go to as many
     // threads as the host has cores.
-    let parsed = parse_shards(&shard_filenames, &shard_paths);
+    let parsed = parse_shards(&shard_filenames, &shard_paths, expected_shards.is_some());
     for (order, ((shard_filename, shard_path), parsed)) in shard_filenames
         .iter()
         .zip(shard_paths)
@@ -1013,6 +1088,11 @@ fn discover_sharded(
         .enumerate()
     {
         let (digest, artifact, start, size_bytes) = parsed?;
+        if expected_shards.is_some_and(|expected| expected.get(*shard_filename) != Some(&digest)) {
+            return Err(ProductionIngestionError::IntegrityMismatch {
+                identity: (*shard_filename).clone(),
+            });
+        }
         shards.push(ModelShard {
             id: ModelShardId::new((*shard_filename).clone()).map_err(|error| {
                 ProductionIngestionError::MalformedMetadata {
@@ -1086,7 +1166,15 @@ fn discover_sharded(
                 data_section_start: *start,
                 offset,
                 length,
-                authenticated_digest: None,
+                authenticated_digest: if expected_shards.is_some() {
+                    Some(real_entry.digest.clone().ok_or_else(|| {
+                        ProductionIngestionError::MalformedMetadata {
+                            reason: format!("authenticated tensor '{tensor_name}' has no digest"),
+                        }
+                    })?)
+                } else {
+                    None
+                },
             },
         );
         let mut tensor = real_entry.clone();
@@ -1219,6 +1307,15 @@ mod tests {
         };
         assert_eq!(inspected.payloads.read_payload(&range).unwrap(), f16);
         assert!(inspected.payloads.map_payload(&range).unwrap().is_none());
+        assert!(inspected.payloads.map_tensor("f16").is_err());
+        assert_eq!(
+            inspected.payloads.read_within("f16", 1, 2).unwrap(),
+            [0x3c, 0]
+        );
+        assert_eq!(
+            inspected.payloads.read_rows("f16", 0, 2, 1, 2).unwrap(),
+            [0, 0]
+        );
         let mut wrong_range = range.clone();
         wrong_range.digest = Some(ModelDigest::sha256(b"wrong tensor"));
         assert!(matches!(
@@ -1233,6 +1330,14 @@ mod tests {
         drop(file);
         assert!(matches!(
             inspected.payloads.read_payload(&range),
+            Err(ProductionIngestionError::IntegrityMismatch { .. })
+        ));
+        assert!(matches!(
+            inspected.payloads.read_within("f16", 1, 2),
+            Err(ProductionIngestionError::IntegrityMismatch { .. })
+        ));
+        assert!(matches!(
+            inspected.payloads.read_rows("f16", 0, 2, 1, 2),
             Err(ProductionIngestionError::IntegrityMismatch { .. })
         ));
     }
